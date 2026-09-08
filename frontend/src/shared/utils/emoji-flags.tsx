@@ -321,40 +321,44 @@ export const NodeFlag: React.FC<{
 }> = ({ flagInfo, style, className }) => {
   const [hasError, setHasError] = useState(false);
 
-  if (flagInfo.flagUrl && !hasError) {
-    return (
-      <img
-        src={flagInfo.flagUrl}
-        alt={flagInfo.countryCode || ''}
-        className={className}
-        onError={() => setHasError(true)}
-        style={{
-          width: '18px',
-          height: '13px',
-          objectFit: 'cover',
-          borderRadius: '2px',
-          flexShrink: 0,
-          display: 'inline-block',
-          verticalAlign: 'middle',
-          boxShadow: '0 1px 2px rgba(0,0,0,0.2)',
-          ...style,
-        }}
-      />
-    );
-  }
-
   return (
     <span
       className={className}
       style={{
-        fontSize: '15px',
-        flexShrink: 0,
+        width: '18px',
+        height: '14px',
+        minWidth: '18px',
+        maxWidth: '18px',
+        minHeight: '14px',
+        maxHeight: '14px',
         display: 'inline-flex',
         alignItems: 'center',
+        justifyContent: 'center',
+        lineHeight: 1,
+        verticalAlign: 'middle',
+        flexShrink: 0,
+        overflow: 'hidden',
         ...style,
       }}
     >
-      {flagInfo.flag || '🌐'}
+      {flagInfo.flagUrl && !hasError ? (
+        <img
+          src={flagInfo.flagUrl}
+          alt={flagInfo.countryCode || ''}
+          onError={() => setHasError(true)}
+          style={{
+            width: '18px',
+            height: '13px',
+            objectFit: 'cover',
+            borderRadius: '2px',
+            boxShadow: '0 1px 2px rgba(0,0,0,0.2)',
+          }}
+        />
+      ) : (
+        <span style={{ fontSize: '13px', lineHeight: 1, display: 'inline-block' }}>
+          {flagInfo.flag || '🌐'}
+        </span>
+      )}
     </span>
   );
 };

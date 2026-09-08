@@ -227,16 +227,16 @@ const OutboundsPageComponent: React.FC<OutboundsPageProps> = ({
                   >
                     {isCollapsed ? <ChevronRight size={16} /> : <ChevronDown size={16} />}
                   </button>
-                  <div>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  <div style={{ display: 'flex', flexDirection: 'column', justifyContent: 'center', height: '42px', overflow: 'hidden' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: '8px', height: '20px', lineHeight: '20px' }}>
                       <span style={{ fontSize: '14.5px', fontWeight: 700 }}>{groupName}</span>
                       {grp.type && <Badge size="xs" variant="outline">{grp.type}</Badge>}
                     </div>
-                    <div style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: '2px', display: 'flex', alignItems: 'center', gap: '4px' }}>
+                    <div style={{ fontSize: '12px', color: 'var(--text-muted)', marginTop: '2px', height: '18px', display: 'flex', alignItems: 'center', gap: '4px', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
                       <span>{t(lang, 'outbounds.activeLabel')}:</span>
                       <span style={{ color: 'var(--accent)', fontWeight: 700, display: 'inline-flex', alignItems: 'center', gap: '5px' }}>
                         <NodeFlag flagInfo={activeFlag} />
-                        <span>{activeFlag.cleanName}</span>
+                        <span style={{ maxWidth: '280px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{activeFlag.cleanName}</span>
                       </span>
                     </div>
                   </div>

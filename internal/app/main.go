@@ -53,7 +53,11 @@ func Run(args []string) {
 	}
 
 	if !isRunningAsAdmin() {
-		showError("Admin rights required", "Приложение должно быть запущено с правами администратора.")
+		if err := restartAsAdmin(); err == nil {
+			// Elevated process successfully requested/spawned, terminate non-elevated instance
+			return
+		}
+		showError("Admin rights required", "Приложение должно быть запущено с правами администратора для работы сетевого стека и TUN интерфейса.")
 		return
 	}
 

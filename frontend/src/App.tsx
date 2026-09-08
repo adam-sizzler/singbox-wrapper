@@ -79,19 +79,45 @@ const AppContent: React.FC = () => {
     }
   };
 
+  const isRunningRef = useRef(false);
+  useEffect(() => {
+    isRunningRef.current = !!state?.running;
+  }, [state?.running]);
+
+  const lastLogIdRef = useRef(0);
+  useEffect(() => {
+    lastLogIdRef.current = lastLogId;
+  }, [lastLogId]);
+
   // Poll state and traffic regularly ONLY when window is active/visible
   useEffect(() => {
     refreshState();
 
+    let idleTick = 0;
     const poll = async () => {
       if (document.hidden || document.visibilityState === 'hidden') return;
+      idleTick++;
+
+      const isRunning = isRunningRef.current;
+      // If sing-box is NOT running, relax state polling to once every 3 seconds (3 ticks)
+      // and do not make traffic API calls at all.
+      if (!isRunning && idleTick % 3 !== 0) {
+        return;
+      }
+
       try {
-        const [s, tr] = await Promise.all([
-          api.getState(),
-          api.getTraffic().catch(() => null),
-        ]);
+        const s = await api.getState();
         setState(s);
-        if (tr) setTraffic(tr);
+        isRunningRef.current = !!s?.running;
+
+        // ONLY query traffic when sing-box is actually running
+        if (s?.running) {
+          const tr = await api.getTraffic().catch(() => null);
+          if (tr) setTraffic(tr);
+        } else {
+          // Zero out speeds if stopped without making any network request
+          setTraffic((prev) => (prev?.download_speed || prev?.upload_speed ? { ...prev, download_speed: 0, upload_speed: 0 } : prev));
+        }
       } catch (e) {
         // ignore network hiccups
       }
@@ -131,10 +157,11 @@ const AppContent: React.FC = () => {
     const pollLogs = async () => {
       if (document.hidden || document.visibilityState === 'hidden') return;
       try {
-        const res = await api.getLogs(lastLogId);
+        const res = await api.getLogs(lastLogIdRef.current);
         if (res?.entries?.length) {
-          setLogs((prev) => [...prev, ...res.entries].slice(-2000));
+          lastLogIdRef.current = res.last_id;
           setLastLogId(res.last_id);
+          setLogs((prev) => [...prev, ...res.entries].slice(-2000));
         }
       } catch (e) {
         // ignore
@@ -156,7 +183,7 @@ const AppContent: React.FC = () => {
       clearInterval(logsTimer);
       document.removeEventListener('visibilitychange', handleVisibility);
     };
-  }, [lastLogId, currentTab]);
+  }, [currentTab]);
 
   // Apply Theme and Accent Color to document
   useEffect(() => {

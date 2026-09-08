@@ -79,6 +79,57 @@ func isRunningAsAdmin() bool {
 	return ret != 0
 }
 
+func restartAsAdmin() error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	real, err := filepath.EvalSymlinks(exe)
+	if err == nil {
+		exe = real
+	}
+
+	verbPtr, err := syscall.UTF16PtrFromString("runas")
+	if err != nil {
+		return err
+	}
+	exePtr, err := syscall.UTF16PtrFromString(exe)
+	if err != nil {
+		return err
+	}
+
+	var argsPtr *uint16
+	if len(os.Args) > 1 {
+		args := strings.Join(os.Args[1:], " ")
+		argsPtr, err = syscall.UTF16PtrFromString(args)
+		if err != nil {
+			return err
+		}
+	}
+
+	dir := filepath.Dir(exe)
+	dirPtr, err := syscall.UTF16PtrFromString(dir)
+	if err != nil {
+		return err
+	}
+
+	ret, _, callErr := procShellExecuteW.Call(
+		0,
+		uintptr(unsafe.Pointer(verbPtr)),
+		uintptr(unsafe.Pointer(exePtr)),
+		uintptr(unsafe.Pointer(argsPtr)),
+		uintptr(unsafe.Pointer(dirPtr)),
+		1, // SW_SHOWNORMAL
+	)
+	if ret <= 32 {
+		if callErr != syscall.Errno(0) {
+			return fmt.Errorf("ShellExecuteW(runas) ret=%d: %w", ret, callErr)
+		}
+		return fmt.Errorf("ShellExecuteW(runas) ret=%d", ret)
+	}
+	return nil
+}
+
 func openURLInDefaultBrowser(rawURL string) error {
 	target := strings.TrimSpace(rawURL)
 	if target == "" {

@@ -388,6 +388,7 @@ body, html {
   padding: 0 20px 0 68px;
   min-height: 72px;
   height: 72px;
+  max-height: 72px;
   box-sizing: border-box;
   background: var(--bg-card);
   border: 1px solid var(--border-color);
@@ -396,6 +397,7 @@ body, html {
   backdrop-filter: blur(12px);
   flex-shrink: 0;
   position: relative;
+  overflow: hidden;
 }
 
 /* Burger Component */
@@ -872,12 +874,15 @@ body, html {
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  padding: 20px 20px;
+  padding: 14px 20px;
   background: radial-gradient(circle at 50% 35%, rgba(253, 215, 90, 0.06) 0%, var(--bg-card) 75%);
   position: relative;
   flex-shrink: 0;
-  min-height: 175px;
+  height: 204px;
+  min-height: 204px;
+  max-height: 204px;
   box-sizing: border-box;
+  overflow: hidden;
 }
 
 .power-btn-wrapper {
@@ -1427,13 +1432,18 @@ body, html {
 
 /* Outbounds & Selector Group Styles */
 .ui-selector-header {
-  padding: 14px 18px;
+  height: 64px;
+  min-height: 64px;
+  max-height: 64px;
+  box-sizing: border-box;
+  padding: 0 18px;
   background: var(--bg-card-subtle);
   border-bottom: 1px solid var(--border-color);
   display: flex;
   align-items: center;
   justify-content: space-between;
   cursor: pointer;
+  overflow: hidden;
 }
 
 .ui-collapse-btn {
@@ -1945,7 +1955,10 @@ body, html {
   align-items: center;
   justify-content: center;
   gap: 8px;
-  padding: 6px 16px;
+  height: 32px;
+  min-height: 32px;
+  max-height: 32px;
+  padding: 0 16px;
   margin-top: 8px;
   border-radius: 999px;
   background: var(--bg-card-subtle);
@@ -1953,9 +1966,11 @@ body, html {
   color: var(--text-main);
   font-size: 12.5px;
   font-weight: 600;
+  line-height: 1;
   cursor: pointer;
   transition: all 0.2s ease;
   max-width: 90%;
+  box-sizing: border-box;
 }
 
 .dashboard-node-pill:hover {
