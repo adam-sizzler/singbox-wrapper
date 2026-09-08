@@ -56,13 +56,26 @@ export const Switch: React.FC<SwitchProps> = ({
   label,
   description,
   disabled = false,
-  id,
 }) => {
-  const switchId = id || (label ? label.toLowerCase().replace(/\s+/g, '-') : undefined);
+  const handleToggle = (e: React.MouseEvent) => {
+    e.preventDefault();
+    if (!disabled) {
+      onChange(!checked);
+    }
+  };
 
   return (
-    <label
-      htmlFor={switchId}
+    <div
+      role="switch"
+      aria-checked={checked}
+      tabIndex={disabled ? -1 : 0}
+      onClick={handleToggle}
+      onKeyDown={(e) => {
+        if (!disabled && (e.key === ' ' || e.key === 'Enter')) {
+          e.preventDefault();
+          onChange(!checked);
+        }
+      }}
       className={`ui-switch-container ${disabled ? 'ui-switch-container--disabled' : ''}`}
     >
       <div className="ui-switch-text">
@@ -70,18 +83,10 @@ export const Switch: React.FC<SwitchProps> = ({
         {description && <span className="ui-switch-desc">{description}</span>}
       </div>
       <div className="ui-switch-toggle-wrap">
-        <input
-          id={switchId}
-          type="checkbox"
-          checked={checked}
-          disabled={disabled}
-          onChange={(e) => onChange(e.target.checked)}
-          className="ui-switch-input"
-        />
         <div className={`ui-switch-track ${checked ? 'ui-switch-track--checked' : ''}`}>
           <div className="ui-switch-thumb" />
         </div>
       </div>
-    </label>
+    </div>
   );
 };

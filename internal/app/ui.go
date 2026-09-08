@@ -1387,16 +1387,36 @@ func (a *App) startCoreOnStartupIfEnabled() {
 	}
 	a.setCoreDesiredRunning(true)
 	go func() {
-		time.Sleep(300 * time.Millisecond)
-		if err := a.withRunningAction(func() error {
+		a.log("Автозапуск ядра: запуск запланирован...")
+		for attempt := 0; attempt < 30; attempt++ {
+			time.Sleep(500 * time.Millisecond)
 			if a.isProcessRunning() {
-				return nil
+				a.log("Автозапуск ядра: ядро уже работает")
+				return
 			}
-			return a.startPipeline()
-		}); err != nil {
+			err := a.withRunningAction(func() error {
+				if a.isProcessRunning() {
+					return nil
+				}
+				return a.startPipeline()
+			})
+			if err == nil {
+				a.log("Автозапуск ядра: ядро успешно запущено")
+				return
+			}
+			// If an operation is already in progress, wait and retry
+			if strings.Contains(err.Error(), "уже выполняется") {
+				continue
+			}
+			if attempt < 3 {
+				continue
+			}
 			a.setCoreDesiredRunning(false)
 			a.log("WARN: автозапуск ядра не выполнен: %v", err)
+			return
 		}
+		a.setCoreDesiredRunning(false)
+		a.log("WARN: автозапуск ядра отменён по тайм-ауту")
 	}()
 }
 
