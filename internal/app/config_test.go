@@ -32,24 +32,23 @@ func TestResolveSubscriptionInput(t *testing.T) {
 		in          string
 		wantURL     string
 		wantProfile string
-		wantVersion string
 		wantErr     bool
 	}{
 		{name: "empty", in: "", wantURL: ""},
 		{name: "http", in: "https://example.com/config.json", wantURL: "https://example.com/config.json"},
+		{name: "http with version param", in: "https://example.com/config.json?version=1.12.0&tag=test", wantURL: "https://example.com/config.json?tag=test"},
 		{
-			name:        "import remote profile",
-			in:          "sing-box://import-remote-profile?url=https%3A%2F%2Fexample.com%2Fsub.json&version=1.11.0#Work",
+			name:        "import remote profile with version param",
+			in:          "sing-box://import-remote-profile?url=https%3A%2F%2Fexample.com%2Fsub.json%3Fversion%3D1.11.0&version=1.11.0#Work",
 			wantURL:     "https://example.com/sub.json",
 			wantProfile: "Work",
-			wantVersion: "1.11.0",
 		},
 		{name: "unsupported scheme", in: "ftp://example.com/config.json", wantErr: true},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gotURL, gotProfile, gotVersion, err := resolveSubscriptionInput(tt.in)
+			gotURL, gotProfile, err := resolveSubscriptionInput(tt.in)
 			if tt.wantErr {
 				if err == nil {
 					t.Fatalf("resolveSubscriptionInput(%q) expected error", tt.in)
@@ -59,8 +58,8 @@ func TestResolveSubscriptionInput(t *testing.T) {
 			if err != nil {
 				t.Fatalf("resolveSubscriptionInput(%q) unexpected error: %v", tt.in, err)
 			}
-			if gotURL != tt.wantURL || gotProfile != tt.wantProfile || gotVersion != tt.wantVersion {
-				t.Fatalf("resolveSubscriptionInput(%q) = (%q, %q, %q), want (%q, %q, %q)", tt.in, gotURL, gotProfile, gotVersion, tt.wantURL, tt.wantProfile, tt.wantVersion)
+			if gotURL != tt.wantURL || gotProfile != tt.wantProfile {
+				t.Fatalf("resolveSubscriptionInput(%q) = (%q, %q), want (%q, %q)", tt.in, gotURL, gotProfile, tt.wantURL, tt.wantProfile)
 			}
 		})
 	}

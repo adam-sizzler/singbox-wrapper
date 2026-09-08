@@ -225,9 +225,9 @@ func applyOwnerWindowBackground(hwnd win.HWND, dark bool) error {
 	}
 	var r, g, b uint32
 	if dark {
-		r, g, b = 0x19, 0x19, 0x27 // тёмно-синий/чёрный под тему приложения
+		r, g, b = 0x0F, 0x11, 0x17 // под тему приложения --bg-main #0f1117
 	} else {
-		r, g, b = 0xF5, 0xF5, 0xF5 // светло-серый под светлую тему
+		r, g, b = 0xF4, 0xF6, 0xFA // под тему приложения --bg-main #f4f6fa
 	}
 	colorRef := uintptr((b << 16) | (g << 8) | r)
 	hBrush, _, _ := procCreateSolidBrush.Call(colorRef)

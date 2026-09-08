@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -73,12 +74,28 @@ func (c AppConfig) MarshalYAML() (interface{}, error) {
 	}, nil
 }
 
+type SubscriptionInfo struct {
+	Title          string `yaml:"title,omitempty" json:"title,omitempty"`
+	Announce       string `yaml:"announce,omitempty" json:"announce,omitempty"`
+	WebPageURL     string `yaml:"web_page_url,omitempty" json:"web_page_url,omitempty"`
+	SupportURL     string `yaml:"support_url,omitempty" json:"support_url,omitempty"`
+	UpdateInterval int    `yaml:"update_interval,omitempty" json:"update_interval,omitempty"`
+	Upload         int64  `yaml:"upload,omitempty" json:"upload,omitempty"`
+	Download       int64  `yaml:"download,omitempty" json:"download,omitempty"`
+	Total          int64  `yaml:"total,omitempty" json:"total,omitempty"`
+	Expire         int64  `yaml:"expire,omitempty" json:"expire,omitempty"`
+	RefillDate     int64  `yaml:"refill_date,omitempty" json:"refill_date,omitempty"`
+	LastUpdated    int64  `yaml:"last_updated,omitempty" json:"last_updated,omitempty"`
+	FileName       string `yaml:"filename,omitempty" json:"filename,omitempty"`
+}
+
 type ConfigProfile struct {
 	Name                    string            `yaml:"name" json:"name"`
 	URL                     string            `yaml:"url" json:"url"`
 	Version                 string            `yaml:"version" json:"version"`
 	SelectorSelections      map[string]string `yaml:"selector_selections,omitempty" json:"selector_selections,omitempty"`
 	SelectorCollapsedGroups map[string]bool   `yaml:"selector_collapsed_groups,omitempty" json:"selector_collapsed_groups,omitempty"`
+	Subscription            *SubscriptionInfo `yaml:"subscription,omitempty" json:"subscription,omitempty"`
 }
 
 func loadOrCreateConfig(path string) (AppConfig, error) {
@@ -126,7 +143,7 @@ func validateConfig(cfg AppConfig) error {
 	if strings.TrimSpace(active.Version) == "" {
 		return errors.New("поле Version не заполнено")
 	}
-	if _, _, _, err := resolveSubscriptionInput(active.URL); err != nil {
+	if _, _, err := resolveSubscriptionInput(active.URL); err != nil {
 		return err
 	}
 	return nil
@@ -202,6 +219,7 @@ func normalizeConfigProfiles(cfg *AppConfig) {
 			Version:                 version,
 			SelectorSelections:      normalizeSelectorSelections(p.SelectorSelections),
 			SelectorCollapsedGroups: normalizeSelectorCollapsedGroups(p.SelectorCollapsedGroups),
+			Subscription:            p.Subscription,
 		})
 	}
 	cfg.Profiles = normalized
@@ -292,12 +310,18 @@ func cloneConfigProfiles(profiles []ConfigProfile) []ConfigProfile {
 	}
 	cloned := make([]ConfigProfile, 0, len(profiles))
 	for _, profile := range profiles {
+		var sub *SubscriptionInfo
+		if profile.Subscription != nil {
+			subCopy := *profile.Subscription
+			sub = &subCopy
+		}
 		cloned = append(cloned, ConfigProfile{
 			Name:                    profile.Name,
 			URL:                     profile.URL,
 			Version:                 profile.Version,
 			SelectorSelections:      cloneSelectorSelections(profile.SelectorSelections),
 			SelectorCollapsedGroups: cloneSelectorCollapsedGroups(profile.SelectorCollapsedGroups),
+			Subscription:            sub,
 		})
 	}
 	return cloned
@@ -530,14 +554,14 @@ func applyImportURIToConfig(cfg *AppConfig, rawImport string) {
 		return
 	}
 
-	if resolvedURL, profileName, coreVersion, err := resolveSubscriptionInput(importURI); err == nil {
-		applyImportToConfig(cfg, resolvedURL, profileName, coreVersion)
+	if resolvedURL, profileName, err := resolveSubscriptionInput(importURI); err == nil {
+		applyImportToConfig(cfg, resolvedURL, profileName)
 		return
 	}
 	setActiveProfileURL(cfg, importURI)
 }
 
-func applyImportToConfig(cfg *AppConfig, resolvedURL, profileName, coreVersion string) {
+func applyImportToConfig(cfg *AppConfig, resolvedURL, profileName string) {
 	if cfg == nil {
 		return
 	}
@@ -548,7 +572,6 @@ func applyImportToConfig(cfg *AppConfig, resolvedURL, profileName, coreVersion s
 	}
 
 	resolvedURL = strings.TrimSpace(strings.Trim(resolvedURL, `"'`))
-	resolvedCoreVersion := normalizeImportedCoreVersion(coreVersion)
 
 	name := sanitizeProfileName(profileName)
 	if name == "" {
@@ -560,77 +583,93 @@ func applyImportToConfig(cfg *AppConfig, resolvedURL, profileName, coreVersion s
 		cfg.Profiles = append(cfg.Profiles, ConfigProfile{
 			Name:    name,
 			URL:     resolvedURL,
-			Version: resolvedCoreVersion,
+			Version: "latest",
 		})
 		target = len(cfg.Profiles) - 1
 	} else {
 		cfg.Profiles[target].URL = resolvedURL
-		cfg.Profiles[target].Version = resolvedCoreVersion
 	}
 	cfg.CurrentProfile = cfg.Profiles[target].Name
 	syncLegacyFromCurrent(cfg)
 }
 
-func resolveSubscriptionInput(raw string) (resolvedURL string, profileName string, coreVersion string, err error) {
+func stripVersionQueryParams(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return rawURL
+	}
+	q := u.Query()
+	modified := false
+	for _, key := range []string{"version", "singbox_version", "core_version"} {
+		if q.Has(key) {
+			q.Del(key)
+			modified = true
+		}
+	}
+	if modified {
+		u.RawQuery = q.Encode()
+	}
+	return u.String()
+}
+
+func resolveSubscriptionInput(raw string) (resolvedURL string, profileName string, err error) {
 	input := strings.TrimSpace(strings.Trim(raw, `"'`))
 	if input == "" {
-		return "", "", "", nil
+		return "", "", nil
 	}
 
 	parsed, err := url.Parse(input)
 	if err != nil {
-		return "", "", "", errors.New("поле URL имеет неверный формат")
+		return "", "", errors.New("поле URL имеет неверный формат")
 	}
 
 	switch strings.ToLower(parsed.Scheme) {
 	case "http", "https":
 		u, err := url.ParseRequestURI(input)
 		if err != nil {
-			return "", "", "", errors.New("поле URL имеет неверный формат")
+			return "", "", errors.New("поле URL имеет неверный формат")
 		}
 		if u.Scheme != "http" && u.Scheme != "https" {
-			return "", "", "", errors.New("поле URL должно начинаться с http:// или https://")
+			return "", "", errors.New("поле URL должно начинаться с http:// или https://")
 		}
-		return input, "", "", nil
+		cleaned := stripVersionQueryParams(input)
+		return cleaned, "", nil
 
 	case "sing-box":
 		if !strings.EqualFold(parsed.Host, "import-remote-profile") {
-			return "", "", "", errors.New("поддерживается только sing-box://import-remote-profile")
+			return "", "", errors.New("поддерживается только sing-box://import-remote-profile")
 		}
 		remoteURL := strings.TrimSpace(parsed.Query().Get("url"))
 		if remoteURL == "" {
-			return "", "", "", errors.New("в import-ссылке не найден параметр url")
+			return "", "", errors.New("в import-ссылке не найден параметр url")
 		}
 		remoteParsed, err := url.ParseRequestURI(remoteURL)
 		if err != nil || (remoteParsed.Scheme != "http" && remoteParsed.Scheme != "https") {
-			return "", "", "", errors.New("параметр url в import-ссылке должен быть http:// или https://")
+			return "", "", errors.New("параметр url в import-ссылке должен быть http:// или https://")
 		}
 		name := strings.TrimSpace(parsed.Fragment)
 		if decoded, err := url.QueryUnescape(name); err == nil {
 			name = strings.TrimSpace(decoded)
 		}
-		version := strings.TrimSpace(parsed.Query().Get("version"))
-		return remoteURL, name, version, nil
+		cleanedRemote := stripVersionQueryParams(remoteURL)
+		return cleanedRemote, name, nil
 
 	default:
-		return "", "", "", errors.New("поле URL должно быть http(s) или sing-box://import-remote-profile?...")
+		return "", "", errors.New("поле URL должно быть http(s) или sing-box://import-remote-profile?...")
 	}
 }
+
+var strictCoreVersionRegex = regexp.MustCompile(`^\d+\.\d+\.\d+$`)
 
 func normalizeImportedCoreVersion(raw string) string {
 	v := strings.TrimSpace(raw)
 	if v == "" || strings.EqualFold(v, "latest") {
 		return "latest"
 	}
-	if len(v) > 0 {
-		if v[0] == 'v' || v[0] == 'V' {
-			v = strings.TrimSpace(v[1:])
-		}
+	if strings.HasPrefix(v, "v") || strings.HasPrefix(v, "V") {
+		v = strings.TrimSpace(v[1:])
 	}
-	if v == "" || strings.EqualFold(v, "latest") {
-		return "latest"
-	}
-	if semverRegex.FindString(v) != v {
+	if !strictCoreVersionRegex.MatchString(v) {
 		return "latest"
 	}
 	return v

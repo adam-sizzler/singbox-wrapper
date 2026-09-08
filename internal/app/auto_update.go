@@ -21,6 +21,7 @@ func (a *App) startAutoUpdateScheduler() {
 	a.autoUpdateMu.Unlock()
 
 	go a.autoUpdateLoop(stop, wake)
+	go a.refreshAllProfilesOnStartup()
 	a.triggerAutoUpdateReconfigure()
 }
 
@@ -116,6 +117,14 @@ func (a *App) runAutoUpdateOnce() {
 	if strings.TrimSpace(res.ResolvedConfigURL) == "" {
 		return
 	}
+
+	active := activeProfileFromConfig(cfg)
+	if res.DetectedVersion != "" && res.DetectedVersion != active.Version {
+		a.log("Конфигурация передала версию sing-box %s (у профиля: %s), обновляю профиль", res.DetectedVersion, active.Version)
+		_ = a.updateActiveProfileVersion(res.DetectedVersion)
+		_ = a.ensureSingBox(res.DetectedVersion)
+	}
+
 	if res.Updated {
 		a.invalidateSelectorCache()
 		a.log("Автообновление: обновлён %s (профиль: %s)", res.RuntimeCfgFile, res.ProfileName)
@@ -129,6 +138,7 @@ type refreshResult struct {
 	RuntimeCfgFile    string
 	ResolvedConfigURL string
 	Updated           bool
+	DetectedVersion   string
 }
 
 func (a *App) refreshActiveProfileRuntimeConfigFromURL(timeout time.Duration) (res refreshResult, err error) {
@@ -142,7 +152,7 @@ func (a *App) refreshActiveProfileRuntimeConfigFromURL(timeout time.Duration) (r
 	res.RuntimeCfgPath = a.runtimeConfigPathForProfile(res.ProfileName)
 	res.RuntimeCfgFile = filepath.Base(res.RuntimeCfgPath)
 
-	res.ResolvedConfigURL, _, _, err = resolveSubscriptionInput(active.URL)
+	res.ResolvedConfigURL, _, err = resolveSubscriptionInput(active.URL)
 	if err != nil {
 		return res, err
 	}
@@ -150,6 +160,37 @@ func (a *App) refreshActiveProfileRuntimeConfigFromURL(timeout time.Duration) (r
 		return res, nil
 	}
 
-	res.Updated, err = a.refreshRuntimeConfigFromURLWithTimeout(res.ResolvedConfigURL, res.RuntimeCfgPath, timeout)
+	downloadRes, err := a.refreshRuntimeConfigFromURLWithTimeout(res.ResolvedConfigURL, res.RuntimeCfgPath, timeout)
+	res.Updated = downloadRes.Updated
+	res.DetectedVersion = downloadRes.DetectedVersion
 	return res, err
 }
+
+func (a *App) refreshAllProfilesOnStartup() {
+	// Give the app 2 seconds to finish UI startup and local initialization
+	time.Sleep(2 * time.Second)
+
+	cfg := a.getConfigSnapshot()
+	for _, p := range cfg.Profiles {
+		url := strings.TrimSpace(p.URL)
+		if url == "" {
+			continue
+		}
+		resolvedURL, _, err := resolveSubscriptionInput(url)
+		if err != nil || resolvedURL == "" {
+			continue
+		}
+		targetPath := a.runtimeConfigPathForProfile(p.Name)
+		res, err := a.refreshRuntimeConfigFromURLWithTimeout(resolvedURL, targetPath, 15*time.Second)
+		if err != nil {
+			a.log("Запуск: не удалось обновить подписку профиля %s: %v", p.Name, err)
+			continue
+		}
+		if res.Updated {
+			a.log("Запуск: конфигурация профиля %s обновлена (хэш изменился)", p.Name)
+		} else {
+			a.log("Запуск: конфигурация профиля %s уже актуальна (хэш совпадает)", p.Name)
+		}
+	}
+}
+

@@ -5,7 +5,9 @@ package app
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"mime"
 	"net"
@@ -21,7 +23,7 @@ type uiAssetServer struct {
 	debug  func(string, ...any)
 }
 
-func startUIAssetServer(debugf func(string, ...any)) (*uiAssetServer, error) {
+func startUIAssetServer(debugf func(string, ...any), apiHandler func(uiBridgeRequest) (any, error)) (*uiAssetServer, error) {
 	assets, err := fs.Sub(uiAssets, "web/ui")
 	if err != nil {
 		return nil, fmt.Errorf("open embedded ui assets: %w", err)
@@ -38,6 +40,42 @@ func startUIAssetServer(debugf func(string, ...any)) (*uiAssetServer, error) {
 	}
 
 	mux := http.NewServeMux()
+	if apiHandler != nil {
+		mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json; charset=utf-8")
+			w.Header().Set("Access-Control-Allow-Origin", "*")
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+			if r.Method == http.MethodOptions {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+
+			var body json.RawMessage
+			if r.Method == http.MethodPost {
+				b, err := io.ReadAll(r.Body)
+				if err != nil {
+					w.WriteHeader(http.StatusBadRequest)
+					_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+					return
+				}
+				body = b
+			}
+
+			res, err := apiHandler(uiBridgeRequest{
+				Method: r.Method,
+				Path:   r.URL.RequestURI(),
+				Body:   body,
+			})
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				_ = json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+				return
+			}
+
+			_ = json.NewEncoder(w).Encode(res)
+		})
+	}
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
 			w.Header().Set("Allow", "GET, HEAD")

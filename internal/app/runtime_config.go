@@ -3,6 +3,8 @@
 package app
 
 import (
+	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 )
@@ -65,6 +67,25 @@ func isReservedWindowsFileBaseName(lower string) bool {
 	}
 }
 
+func (a *App) singBoxDir() string {
+	dir := filepath.Join(a.workDir, "singbox")
+	_ = os.MkdirAll(dir, 0o755)
+	return dir
+}
+
 func (a *App) runtimeConfigPathForProfile(profileName string) string {
-	return filepath.Join(a.workDir, runtimeConfigFileNameForProfile(profileName))
+	dir := a.singBoxDir()
+	name := runtimeConfigFileNameForProfile(profileName)
+	target := filepath.Join(dir, name)
+
+	// Migrate if existing profile config is currently in root workDir
+	if _, err := os.Stat(target); errors.Is(err, os.ErrNotExist) {
+		oldPath := filepath.Join(a.workDir, name)
+		if _, oldErr := os.Stat(oldPath); oldErr == nil {
+			if b, readErr := os.ReadFile(oldPath); readErr == nil {
+				_ = os.WriteFile(target, b, 0o644)
+			}
+		}
+	}
+	return target
 }

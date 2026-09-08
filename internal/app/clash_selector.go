@@ -467,29 +467,41 @@ func (a *App) invalidateSelectorCache() {
 	a.clearSelectorCacheLocked()
 }
 
+func cloneOutboundsMap(src map[string]OutboundInfo) map[string]OutboundInfo {
+	if len(src) == 0 {
+		return nil
+	}
+	dst := make(map[string]OutboundInfo, len(src))
+	for k, v := range src {
+		dst[k] = v
+	}
+	return dst
+}
+
 func (a *App) clearSelectorCacheLocked() {
 	a.selectorCacheProfile = ""
 	a.selectorCacheLive = false
 	a.selectorCacheExpiresAt = time.Time{}
 	a.selectorCacheGroups = nil
+	a.selectorCacheOutbounds = nil
 }
 
-func (a *App) selectorCacheSnapshot(profileName string, now time.Time) ([]SelectorGroupState, bool, bool) {
+func (a *App) selectorCacheSnapshot(profileName string, now time.Time) ([]SelectorGroupState, map[string]OutboundInfo, bool, bool) {
 	a.clashMu.Lock()
 	defer a.clashMu.Unlock()
 	if strings.TrimSpace(profileName) == "" {
-		return nil, false, false
+		return nil, nil, false, false
 	}
 	if !strings.EqualFold(a.selectorCacheProfile, profileName) {
-		return nil, false, false
+		return nil, nil, false, false
 	}
 	if a.selectorCacheExpiresAt.IsZero() || now.After(a.selectorCacheExpiresAt) {
-		return nil, false, false
+		return nil, nil, false, false
 	}
-	return cloneSelectorGroups(a.selectorCacheGroups), a.selectorCacheLive, true
+	return cloneSelectorGroups(a.selectorCacheGroups), cloneOutboundsMap(a.selectorCacheOutbounds), a.selectorCacheLive, true
 }
 
-func (a *App) setSelectorCache(profileName string, groups []SelectorGroupState, live bool, now time.Time) {
+func (a *App) setSelectorCache(profileName string, groups []SelectorGroupState, outbounds map[string]OutboundInfo, live bool, now time.Time) {
 	a.clashMu.Lock()
 	defer a.clashMu.Unlock()
 	a.selectorCacheProfile = strings.TrimSpace(profileName)
@@ -499,6 +511,7 @@ func (a *App) setSelectorCache(profileName string, groups []SelectorGroupState, 
 	for i := range a.selectorCacheGroups {
 		a.selectorCacheGroups[i].CanSwitch = false
 	}
+	a.selectorCacheOutbounds = cloneOutboundsMap(outbounds)
 }
 
 func selectorDelayCacheKey(profileName, selectorName, outboundName string) string {
@@ -547,44 +560,36 @@ func (a *App) applyCachedSelectorDelays(profileName string, groups []SelectorGro
 }
 
 func (a *App) selectorGroupsSnapshot(active ConfigProfile, running bool, busy bool) []SelectorGroupState {
+	if !running {
+		return nil
+	}
+
 	profileName := strings.TrimSpace(active.Name)
 	if profileName == "" {
 		profileName = "profile-1"
 	}
 
 	now := time.Now()
-	cached, live, ok := a.selectorCacheSnapshot(profileName, now)
-	if ok {
+	cached, _, live, ok := a.selectorCacheSnapshot(profileName, now)
+	if ok && live {
 		a.applyCachedSelectorDelays(profileName, cached)
-		canSwitch := !busy && (!running || live)
+		canSwitch := !busy
 		for i := range cached {
 			cached[i].CanSwitch = canSwitch && selectorGroupAllowsManualSwitch(cached[i])
 		}
 		return cached
 	}
 
-	var (
-		groups []SelectorGroupState
-		err    error
-	)
-	live = false
-
-	if running {
-		groups, err = a.clashGetProxies()
-		if err == nil && len(groups) > 0 {
-			live = true
-		}
-	}
-
-	if len(groups) == 0 {
-		groups, _ = a.selectorGroupsFromRuntimeProfile(profileName, active.SelectorSelections)
+	groups, outbounds, err := a.clashGetProxiesAndOutbounds()
+	if err != nil || len(groups) == 0 {
+		return nil
 	}
 
 	a.applyCachedSelectorDelays(profileName, groups)
-	a.setSelectorCache(profileName, groups, live, now)
+	a.setSelectorCache(profileName, groups, outbounds, true, now)
 
 	cloned := cloneSelectorGroups(groups)
-	canSwitch := !busy && (!running || live)
+	canSwitch := !busy
 	for i := range cloned {
 		cloned[i].CanSwitch = canSwitch && selectorGroupAllowsManualSwitch(cloned[i])
 	}
@@ -713,26 +718,59 @@ func selectorGroupSortPriority(group SelectorGroupState) int {
 }
 
 func (a *App) clashGetProxies() ([]SelectorGroupState, error) {
+	groups, _, err := a.clashGetProxiesAndOutbounds()
+	return groups, err
+}
+
+func (a *App) clashGetProxiesAndOutbounds() ([]SelectorGroupState, map[string]OutboundInfo, error) {
 	var payload struct {
 		Proxies map[string]json.RawMessage `json:"proxies"`
 	}
 	if err := a.clashAPIRequest(http.MethodGet, "/proxies", nil, &payload); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	if len(payload.Proxies) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 
-	proxyDelays := parseProxyHistoryDelays(payload.Proxies)
+	proxyDelays := make(map[string]SelectorOptionDelayState, len(payload.Proxies))
 	groups := make([]SelectorGroupState, 0, len(payload.Proxies))
+	outbounds := make(map[string]OutboundInfo, len(payload.Proxies))
+
 	for name, raw := range payload.Proxies {
+		tag := strings.TrimSpace(name)
+		if tag == "" {
+			continue
+		}
 		var item map[string]any
 		if err := json.Unmarshal(raw, &item); err != nil {
 			continue
 		}
-		rawType := parseString(item["type"])
-		groupType := normalizeSelectorGroupType(rawType)
+		if altTag := strings.TrimSpace(parseString(item["name"])); altTag != "" && tag == "" {
+			tag = altTag
+		}
+
+		// 1. Delays
+		if delay, checkedAt, ok := parseProxyHistoryDelay(item["history"]); ok {
+			proxyDelays[strings.ToLower(tag)] = SelectorOptionDelayState{Delay: delay, CheckedAt: checkedAt}
+		}
+
+		// 2. Outbounds info
+		typ := strings.TrimSpace(parseString(item["type"]))
+		srv := strings.TrimSpace(parseString(item["server"]))
+		port, _ := parseIntValue(item["port"])
+		if typ != "" || srv != "" || port > 0 {
+			outbounds[tag] = OutboundInfo{
+				Tag:        tag,
+				Type:       typ,
+				Server:     srv,
+				ServerPort: port,
+			}
+		}
+
+		// 3. Groups (Selector / URLTest)
+		groupType := normalizeSelectorGroupType(typ)
 		if groupType == "" {
 			continue
 		}
@@ -744,20 +782,16 @@ func (a *App) clashGetProxies() ([]SelectorGroupState, error) {
 		if !containsStringFold(options, current) {
 			current = options[0]
 		}
-		tag := strings.TrimSpace(name)
-		if tag == "" {
-			tag = strings.TrimSpace(parseString(item["name"]))
-		}
-		if tag == "" {
-			continue
-		}
 		groups = append(groups, SelectorGroupState{
-			Name:         tag,
-			Type:         groupType,
-			Current:      current,
-			Options:      options,
-			OptionDelays: selectorOptionDelaysFromProxyHistory(options, proxyDelays),
+			Name:    tag,
+			Type:    groupType,
+			Current: current,
+			Options: options,
 		})
+	}
+
+	for i := range groups {
+		groups[i].OptionDelays = selectorOptionDelaysFromProxyHistory(groups[i].Options, proxyDelays)
 	}
 
 	sort.SliceStable(groups, func(i, j int) bool {
@@ -768,33 +802,8 @@ func (a *App) clashGetProxies() ([]SelectorGroupState, error) {
 		}
 		return strings.ToLower(groups[i].Name) < strings.ToLower(groups[j].Name)
 	})
-	return groups, nil
-}
 
-func parseProxyHistoryDelays(proxies map[string]json.RawMessage) map[string]SelectorOptionDelayState {
-	if len(proxies) == 0 {
-		return nil
-	}
-	result := make(map[string]SelectorOptionDelayState)
-	for name, raw := range proxies {
-		name = strings.TrimSpace(name)
-		if name == "" {
-			continue
-		}
-		var item map[string]any
-		if err := json.Unmarshal(raw, &item); err != nil {
-			continue
-		}
-		delay, checkedAt, ok := parseProxyHistoryDelay(item["history"])
-		if !ok {
-			continue
-		}
-		result[strings.ToLower(name)] = SelectorOptionDelayState{Delay: delay, CheckedAt: checkedAt}
-	}
-	if len(result) == 0 {
-		return nil
-	}
-	return result
+	return groups, outbounds, nil
 }
 
 func parseProxyHistoryDelay(raw any) (int, int64, bool) {
@@ -939,23 +948,23 @@ func (a *App) clashAPIRequest(method, route string, payload any, out any) error 
 	}
 	defer resp.Body.Close()
 
-	bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return err
-	}
-
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		errBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 16*1024))
 		return &clashHTTPError{
 			StatusCode: resp.StatusCode,
-			Message:    parseClashAPIError(bodyBytes),
+			Message:    parseClashAPIError(errBytes),
 		}
 	}
 
-	if out == nil || len(bytes.TrimSpace(bodyBytes)) == 0 {
+	if out == nil {
+		_, _ = io.Copy(io.Discard, resp.Body)
 		return nil
 	}
 
-	if err := json.Unmarshal(bodyBytes, out); err != nil {
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
 		return err
 	}
 	return nil
@@ -1389,3 +1398,25 @@ func (a *App) applySavedSelectorSelections(profile ConfigProfile) {
 		}
 	}(profileName, copiedSelections)
 }
+
+func (a *App) outboundsSnapshotForProfile(profileName string, running bool) map[string]OutboundInfo {
+	if !running {
+		return nil
+	}
+	profileName = strings.TrimSpace(profileName)
+	if profileName == "" {
+		profileName = "profile-1"
+	}
+	now := time.Now()
+	_, outbounds, live, ok := a.selectorCacheSnapshot(profileName, now)
+	if ok && live && len(outbounds) > 0 {
+		return outbounds
+	}
+	groups, freshOutbounds, err := a.clashGetProxiesAndOutbounds()
+	if err == nil && len(freshOutbounds) > 0 {
+		a.setSelectorCache(profileName, groups, freshOutbounds, true, now)
+		return freshOutbounds
+	}
+	return nil
+}
+

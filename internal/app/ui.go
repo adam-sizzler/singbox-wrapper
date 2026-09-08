@@ -42,9 +42,9 @@ const (
 	gclpHICON              = int32(-14)
 	gclpHICONSM            = int32(-34)
 	mainWindowMinWidth     = 940
-	mainWindowMinHeight    = 620
+	mainWindowMinHeight    = 660
 	mainWindowMaxWidth     = 1480
-	mainWindowMaxHeight    = 980
+	mainWindowMaxHeight    = 1040
 	embeddedSyncDebounce   = 60 * time.Millisecond
 )
 
@@ -73,7 +73,7 @@ func (a *App) runUI() error {
 		startMinimizedToTray,
 	)
 
-	uiServer, err := startUIAssetServer(a.debugf)
+	uiServer, err := startUIAssetServer(a.debugf, a.handleUIBridgeCall)
 	if err != nil {
 		a.debugf("ui: startUIAssetServer failed: %v", err)
 		return err
@@ -1094,12 +1094,12 @@ func setImmersiveDarkMode(hwnd win.HWND, dark bool) {
 
 	var caption, text, border uint32
 	if dark {
-		caption = rgbToColorRef(0x31, 0x31, 0x31)
-		text = rgbToColorRef(0xF3, 0xF3, 0xF3)
+		caption = rgbToColorRef(0x0F, 0x11, 0x17) // совпадает с --bg-main #0f1117
+		text = rgbToColorRef(0xF0, 0xF3, 0xFA)    // совпадает с --text-main #f0f3fa
 		border = dwmColorNone
 	} else {
-		caption = rgbToColorRef(0xD9, 0xDE, 0xE6)
-		text = rgbToColorRef(0x1E, 0x22, 0x2C)
+		caption = rgbToColorRef(0xF4, 0xF6, 0xFA) // совпадает с --bg-main #f4f6fa
+		text = rgbToColorRef(0x14, 0x18, 0x24)    // совпадает с --text-main #141824
 		border = dwmColorNone
 	}
 	dwmSet(uintptr(dwmwaCaptionColor), unsafe.Pointer(&caption), unsafe.Sizeof(caption))
@@ -1238,16 +1238,73 @@ func (a *App) initNotifyIcon() error {
 	if icon := a.loadMainWindowIcon(); icon != nil {
 		_ = ni.SetIcon(icon)
 	}
-	_ = ni.SetToolTip("singbox-wrapper")
+	updateToolTip := func() {
+		cfg := a.getConfigSnapshot()
+		profile := cfg.CurrentProfile
+		if profile == "" {
+			profile = "default"
+		}
+		if a.isProcessRunning() {
+			_ = ni.SetToolTip(fmt.Sprintf("singbox-wrapper: %s (Подключено)", profile))
+		} else {
+			_ = ni.SetToolTip(fmt.Sprintf("singbox-wrapper: %s (Отключено)", profile))
+		}
+	}
+	updateToolTip()
+
 	if err := ni.SetVisible(true); err != nil {
 		_ = ni.Dispose()
 		return err
 	}
 
+	ni.MouseDown().Attach(func(x, y int, button walk.MouseButton) {
+		updateToolTip()
+	})
+
 	showAction := walk.NewAction()
-	_ = showAction.SetText("Открыть")
+	_ = showAction.SetText("Показать")
 	showAction.Triggered().Attach(func() {
 		a.showMainWindowFromTray()
+	})
+
+	refreshAction := walk.NewAction()
+	_ = refreshAction.SetText("Обновить подписку")
+	refreshAction.Triggered().Attach(func() {
+		go func() {
+			if err := a.refreshConfigAction(); err != nil {
+				a.log("Ошибка обновления подписки: %v", err)
+			}
+		}()
+	})
+
+	startAction := walk.NewAction()
+	_ = startAction.SetText("Старт")
+	startAction.Triggered().Attach(func() {
+		go func() {
+			if err := a.startCoreAction(); err != nil {
+				a.log("Ошибка запуска: %v", err)
+			}
+		}()
+	})
+
+	stopAction := walk.NewAction()
+	_ = stopAction.SetText("Стоп")
+	stopAction.Triggered().Attach(func() {
+		go func() {
+			if err := a.stopCoreAction(); err != nil {
+				a.log("Ошибка остановки: %v", err)
+			}
+		}()
+	})
+
+	restartAction := walk.NewAction()
+	_ = restartAction.SetText("Перезапуск")
+	restartAction.Triggered().Attach(func() {
+		go func() {
+			if err := a.restartCoreAction(); err != nil {
+				a.log("Ошибка перезапуска: %v", err)
+			}
+		}()
 	})
 
 	exitAction := walk.NewAction()
@@ -1257,6 +1314,12 @@ func (a *App) initNotifyIcon() error {
 	})
 
 	_ = ni.ContextMenu().Actions().Add(showAction)
+	_ = ni.ContextMenu().Actions().Add(refreshAction)
+	_ = ni.ContextMenu().Actions().Add(walk.NewSeparatorAction())
+	_ = ni.ContextMenu().Actions().Add(startAction)
+	_ = ni.ContextMenu().Actions().Add(stopAction)
+	_ = ni.ContextMenu().Actions().Add(restartAction)
+	_ = ni.ContextMenu().Actions().Add(walk.NewSeparatorAction())
 	_ = ni.ContextMenu().Actions().Add(exitAction)
 
 	ni.MouseUp().Attach(func(x, y int, button walk.MouseButton) {

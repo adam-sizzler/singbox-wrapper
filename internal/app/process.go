@@ -12,6 +12,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"singbox-gui-client/internal/app/db"
 )
 
 // sysDLLKernel32 объявлена в system.go — один LazyDLL на пакет.
@@ -74,49 +76,41 @@ func (a *App) toggleStartStop() error {
 	})
 }
 
-func (a *App) checkConfigAction() error {
+func (a *App) startCoreAction() error {
 	return a.withRunningAction(func() error {
-		cfg := a.getConfigSnapshot()
-		if err := validateConfig(cfg); err != nil {
-			return err
-		}
-
-		active := activeProfileFromConfig(cfg)
-		profileName := strings.TrimSpace(active.Name)
-		if profileName == "" {
-			profileName = "profile-1"
-		}
-		runtimeCfgPath := a.runtimeConfigPathForProfile(profileName)
-		runtimeCfgFile := filepath.Base(runtimeCfgPath)
-
-		resolvedConfigURL, _, _, err := resolveSubscriptionInput(active.URL)
-		if err != nil {
-			return err
-		}
-
-		resolvedVersion, err := resolveVersion(active.Version)
-		if err != nil {
-			return fmt.Errorf("не удалось определить версию sing-box: %w", err)
-		}
-		if err := a.ensureSingBox(resolvedVersion); err != nil {
-			return err
-		}
-
-		if strings.TrimSpace(resolvedConfigURL) == "" {
-			if err := a.ensureLocalRuntimeConfig(runtimeCfgPath); err != nil {
-				return err
-			}
-			if err := validateRuntimeConfigWithSingBox(a.singBoxPath, runtimeCfgPath, singBoxCheckTimeout); err != nil {
-				return err
-			}
-			a.log("Проверка конфигурации OK: локальный %s валиден для sing-box (профиль: %s)", runtimeCfgFile, profileName)
+		if a.isProcessRunning() {
 			return nil
 		}
-
-		if err := validateRemoteRuntimeConfigWithSingBox(resolvedConfigURL, uiConfigActionTimeout, cfg.AllowInsecure, a.singBoxPath, singBoxCheckTimeout); err != nil {
+		a.setCoreDesiredRunning(true)
+		if err := a.startPipeline(); err != nil {
+			a.setCoreDesiredRunning(false)
 			return err
 		}
-		a.log("Проверка конфигурации OK: URL доступен и конфиг валиден для sing-box (профиль: %s)", profileName)
+		return nil
+	})
+}
+
+func (a *App) stopCoreAction() error {
+	return a.withRunningAction(func() error {
+		if !a.isProcessRunning() {
+			return nil
+		}
+		a.setCoreDesiredRunning(false)
+		a.stopProcess()
+		return nil
+	})
+}
+
+func (a *App) restartCoreAction() error {
+	return a.withRunningAction(func() error {
+		a.setCoreDesiredRunning(true)
+		if a.isProcessRunning() {
+			a.stopProcess()
+		}
+		if err := a.startPipeline(); err != nil {
+			a.setCoreDesiredRunning(false)
+			return err
+		}
 		return nil
 	})
 }
@@ -130,26 +124,39 @@ func (a *App) refreshConfigAction() error {
 
 		res, err := a.refreshActiveProfileRuntimeConfigFromURL(uiConfigActionTimeout)
 		if err != nil {
+			active := activeProfileFromConfig(cfg)
+			runtimeCfgPath := a.runtimeConfigPathForProfile(active.Name)
+			runtimeCfgFile := filepath.Base(runtimeCfgPath)
+			if _, statErr := os.Stat(runtimeCfgPath); statErr == nil {
+				if valErr := validateRuntimeConfigFile(runtimeCfgPath); valErr == nil {
+					a.log("WARN: не удалось обновить конфиг из сети (хост недоступен): %v", err)
+					a.log("Используется ранее загруженная конфигурация %s (профиль: %s)", runtimeCfgFile, active.Name)
+					return nil
+				}
+			}
 			return err
 		}
 
+		active := activeProfileFromConfig(cfg)
 		if strings.TrimSpace(res.ResolvedConfigURL) == "" {
 			if err := a.ensureLocalRuntimeConfig(res.RuntimeCfgPath); err != nil {
 				return err
 			}
-			a.log("Конфигурация обновлена: подготовлен локальный %s (профиль: %s)", res.RuntimeCfgFile, res.ProfileName)
+			a.log("Локальный профиль без ссылки: %s (профиль: %s)", res.RuntimeCfgFile, res.ProfileName)
 		} else {
+			if res.DetectedVersion != "" && res.DetectedVersion != active.Version {
+				a.log("Конфигурация передала версию sing-box %s (у профиля: %s), обновляю профиль", res.DetectedVersion, active.Version)
+				_ = a.updateActiveProfileVersion(res.DetectedVersion)
+				_ = a.ensureSingBox(res.DetectedVersion)
+			}
 			if res.Updated {
-				a.log("Конфигурация обновлена: %s (профиль: %s)", res.RuntimeCfgFile, res.ProfileName)
+				a.log("Конфигурация обновлена (хэш изменился): %s (профиль: %s)", res.RuntimeCfgFile, res.ProfileName)
 				a.invalidateSelectorCache()
 			} else {
-				a.log("Конфигурация уже актуальна: %s (профиль: %s)", res.RuntimeCfgFile, res.ProfileName)
+				a.log("Конфигурация уже актуальна (хэш совпадает): %s (профиль: %s)", res.RuntimeCfgFile, res.ProfileName)
 			}
 		}
 
-		if a.isProcessRunning() {
-			a.log("Для применения обновлённого конфига перезапустите ядро")
-		}
 		return nil
 	})
 }
@@ -180,7 +187,7 @@ func (a *App) startPipeline() error {
 		return err
 	}
 	active := activeProfileFromConfig(cfg)
-	resolvedConfigURL, _, _, err := resolveSubscriptionInput(active.URL)
+	resolvedConfigURL, _, err := resolveSubscriptionInput(active.URL)
 	if err != nil {
 		return err
 	}
@@ -207,21 +214,31 @@ func (a *App) startPipeline() error {
 		if err := a.ensureLocalRuntimeConfig(runtimeCfgPath); err != nil {
 			return err
 		}
-		a.log("URL не задан, использую локальный %s", runtimeCfgFile)
+		a.log("Локальный профиль без ссылки, использую %s", runtimeCfgFile)
 	} else {
-		updated, fetchErr := a.refreshRuntimeConfigFromURL(resolvedConfigURL, runtimeCfgPath)
-		if fetchErr != nil {
-			// Подписка недоступна — логируем предупреждение и пробуем использовать
-			// кэшированный конфиг. Если кэша тоже нет — прерываем запуск.
-			a.log("WARN: не удалось обновить подписку: %v", fetchErr)
-			if err := a.ensureLocalRuntimeConfig(runtimeCfgPath); err != nil {
-				return fmt.Errorf("подписка недоступна и локальный %s не найден: %w", runtimeCfgFile, fetchErr)
+		configReady := false
+		if _, statErr := os.Stat(runtimeCfgPath); statErr == nil {
+			if valErr := validateRuntimeConfigFile(runtimeCfgPath); valErr == nil {
+				configReady = true
+				a.log("Использую конфигурацию %s (профиль: %s)", runtimeCfgFile, active.Name)
 			}
-			a.log("Использую кэшированный %s (подписка была недоступна)", runtimeCfgFile)
-		} else if updated {
-			a.log("Скачан и обновлён %s", runtimeCfgFile)
-		} else {
-			a.log("%s уже актуален", runtimeCfgFile)
+		}
+		if !configReady {
+			downloadRes, fetchErr := a.refreshRuntimeConfigFromURL(resolvedConfigURL, runtimeCfgPath)
+			if fetchErr != nil {
+				a.log("WARN: ссылка подписки недоступна: %v", fetchErr)
+				if err := a.ensureLocalRuntimeConfig(runtimeCfgPath); err != nil {
+					return fmt.Errorf("подписка недоступна и локальный %s не найден: %w", runtimeCfgFile, fetchErr)
+				}
+				a.log("Использую кэшированный %s (подписка была недоступна)", runtimeCfgFile)
+			} else {
+				if downloadRes.DetectedVersion != "" && downloadRes.DetectedVersion != active.Version {
+					a.log("Конфигурация передала версию sing-box %s (у профиля: %s), обновляю профиль", downloadRes.DetectedVersion, active.Version)
+					_ = a.updateActiveProfileVersion(downloadRes.DetectedVersion)
+					_ = a.ensureSingBox(downloadRes.DetectedVersion)
+				}
+				a.log("Скачана конфигурация %s (профиль: %s)", runtimeCfgFile, active.Name)
+			}
 		}
 	}
 
@@ -274,6 +291,15 @@ func (a *App) startPipeline() error {
 func (a *App) ensureLocalRuntimeConfig(runtimeCfgPath string) error {
 	a.runtimeCfgMu.Lock()
 	defer a.runtimeCfgMu.Unlock()
+	if a.store != nil {
+		cfg := a.getConfigSnapshot()
+		active := activeProfileFromConfig(cfg)
+		if dbContent, dbErr := a.store.GetProfileConfig(active.Name); dbErr == nil && len(dbContent) > 0 {
+			_ = os.MkdirAll(filepath.Dir(runtimeCfgPath), 0o755)
+			_ = os.WriteFile(runtimeCfgPath, []byte(dbContent), 0o644)
+			return nil
+		}
+	}
 	return ensureLocalRuntimeConfig(runtimeCfgPath)
 }
 
@@ -281,12 +307,23 @@ func (a *App) runtimeConfigWithClashAPI(runtimeCfgPath, controller, secret strin
 	a.runtimeCfgMu.Lock()
 	defer a.runtimeCfgMu.Unlock()
 
-	content, err := os.ReadFile(runtimeCfgPath)
-	if err != nil {
-		return "", "", err
+	var content []byte
+	cfg := a.getConfigSnapshot()
+	active := activeProfileFromConfig(cfg)
+	if a.store != nil {
+		if dbContent, dbErr := a.store.GetProfileConfig(active.Name); dbErr == nil && len(dbContent) > 0 {
+			content = []byte(dbContent)
+		}
+	}
+	if len(content) == 0 {
+		var readErr error
+		content, readErr = os.ReadFile(runtimeCfgPath)
+		if readErr != nil {
+			return "", "", readErr
+		}
 	}
 
-	tmpFile, err := os.CreateTemp(a.workDir, filepath.Base(runtimeCfgPath)+".run-*.json")
+	tmpFile, err := os.CreateTemp(filepath.Dir(runtimeCfgPath), filepath.Base(runtimeCfgPath)+".run-*.json")
 	if err != nil {
 		return "", "", err
 	}
@@ -316,32 +353,102 @@ func removeRuntimeTempFile(path string) {
 	_ = os.Remove(path)
 }
 
-func (a *App) refreshRuntimeConfigFromURL(url, runtimeCfgPath string) (bool, error) {
+func (a *App) refreshRuntimeConfigFromURL(url, runtimeCfgPath string) (runtimeConfigDownloadResult, error) {
 	return a.refreshRuntimeConfigFromURLWithTimeout(url, runtimeCfgPath, 0)
 }
 
-func (a *App) refreshRuntimeConfigFromURLWithTimeout(url, runtimeCfgPath string, timeout time.Duration) (bool, error) {
+func (a *App) refreshRuntimeConfigFromURLWithTimeout(url, runtimeCfgPath string, timeout time.Duration) (runtimeConfigDownloadResult, error) {
 	cfg := a.getConfigSnapshot()
+	active := activeProfileFromConfig(cfg)
 	a.runtimeCfgMu.Lock()
 	defer a.runtimeCfgMu.Unlock()
-	return downloadRuntimeConfigWithOptions(url, runtimeCfgPath, timeout, cfg.AllowInsecure)
+	res, err := downloadRuntimeConfigWithOptions(url, runtimeCfgPath, timeout, cfg.AllowInsecure, active.Version)
+	if err == nil {
+		if res.Subscription.LastUpdated > 0 {
+			_ = a.updateActiveProfileSubscription(res.Subscription)
+		}
+		if res.Updated && a.store != nil {
+			if content, readErr := os.ReadFile(runtimeCfgPath); readErr == nil {
+				_ = a.store.SaveProfileConfig(active.Name, string(content))
+			}
+		}
+	}
+	return res, err
+}
+
+func (a *App) updateActiveProfileSubscription(sub SubscriptionInfo) error {
+	a.cfgMu.Lock()
+	defer a.cfgMu.Unlock()
+	idx := activeProfileIndex(&a.config)
+	if idx >= 0 && idx < len(a.config.Profiles) {
+		a.config.Profiles[idx].Subscription = &sub
+		_ = saveConfig(a.configPath, a.config)
+		if a.store != nil {
+			_ = a.store.SaveProfileSubscription(a.config.Profiles[idx].Name, db.SubscriptionRecord{
+				ProfileName:    a.config.Profiles[idx].Name,
+				Title:          sub.Title,
+				Announce:       sub.Announce,
+				WebPageURL:     sub.WebPageURL,
+				SupportURL:     sub.SupportURL,
+				UpdateInterval: sub.UpdateInterval,
+				Upload:         sub.Upload,
+				Download:       sub.Download,
+				Total:          sub.Total,
+				Expire:         sub.Expire,
+				RefillDate:     sub.RefillDate,
+				LastUpdated:    sub.LastUpdated,
+				FileName:       sub.FileName,
+			})
+		}
+	}
+	return nil
+}
+
+func (a *App) updateActiveProfileVersion(newVersion string) error {
+	newVersion = strings.TrimSpace(newVersion)
+	if newVersion == "" {
+		return nil
+	}
+	a.cfgMu.Lock()
+	defer a.cfgMu.Unlock()
+	idx := activeProfileIndex(&a.config)
+	if idx >= 0 && idx < len(a.config.Profiles) {
+		a.config.Profiles[idx].Version = newVersion
+		_ = saveConfig(a.configPath, a.config)
+	}
+	return nil
 }
 
 func (a *App) ensureSingBox(targetVersion string) error {
 	installedVersion, err := detectSingBoxVersion(a.singBoxPath)
 	if err != nil {
-		return fmt.Errorf("не удалось проверить установленную версию sing-box: %w", err)
-	}
-	if installedVersion == targetVersion {
-		a.log("Найдена подходящая версия sing-box: %s", installedVersion)
-		return nil
+		a.log("WARN: не удалось проверить установленную версию sing-box: %v", err)
 	}
 
-	a.log("Требуется sing-box %s (текущая: %s)", targetVersion, emptyIf(installedVersion, "не найден"))
-	if err := downloadAndInstallSingBox(targetVersion, a.singBoxPath); err != nil {
-		return err
+	cronetDllPath := filepath.Join(filepath.Dir(a.singBoxPath), "libcronet.dll")
+	hasCronet := true
+	if _, err := os.Stat(cronetDllPath); os.IsNotExist(err) {
+		hasCronet = false
 	}
-	a.log("Установлен sing-box %s", targetVersion)
+
+	if installedVersion != "" && (targetVersion == "" || targetVersion == "latest" || installedVersion == targetVersion) {
+		if hasCronet {
+			a.log("Найдена подходящая версия sing-box: %s", installedVersion)
+			return nil
+		}
+		a.log("Найдена версия sing-box: %s, но отсутствует libcronet.dll. Загружаю компоненты ядра...", installedVersion)
+	} else {
+		a.log("Требуется sing-box %s (текущая: %s)", targetVersion, emptyIf(installedVersion, "не найден"))
+	}
+
+	if err := downloadAndInstallSingBox(targetVersion, a.singBoxPath); err != nil {
+		if installedVersion != "" {
+			a.log("WARN: не удалось скачать sing-box %s (возможно, недоступен GitHub: %v). Запускаю с уже установленной версией %s", targetVersion, err, installedVersion)
+			return nil
+		}
+		return fmt.Errorf("не удалось скачать sing-box %s и локальная версия отсутствует: %w", targetVersion, err)
+	}
+	a.log("Установлен sing-box %s (со всеми библиотеками)", targetVersion)
 	return nil
 }
 
@@ -353,16 +460,22 @@ func (a *App) startProcess(runtimeCfgPath string, envOverrides map[string]string
 		return fmt.Errorf("не найден %s", filepath.Base(runtimeCfgPath))
 	}
 
+	binDir := filepath.Dir(a.singBoxPath)
 	cmd := exec.Command(a.singBoxPath, "run", "-c", runtimeCfgPath)
-	cmd.Dir = a.workDir
+	cmd.Dir = binDir
 	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: createNoWindow | createNewProcessGroup}
+
+	env := os.Environ()
+	pathEnv := os.Getenv("PATH")
+	if !strings.Contains(strings.ToLower(pathEnv), strings.ToLower(binDir)) {
+		env = append(env, "PATH="+binDir+";"+pathEnv)
+	}
 	if len(envOverrides) > 0 {
-		env := os.Environ()
 		for key, value := range envOverrides {
 			env = append(env, key+"="+value)
 		}
-		cmd.Env = env
 	}
+	cmd.Env = env
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -406,14 +519,46 @@ func (a *App) startProcess(runtimeCfgPath string, envOverrides map[string]string
 			if !wasStop {
 				a.log("WARN: sing-box завершился с ошибкой: %v", err)
 			}
-			return
+		} else if !wasStop {
+			a.log("sing-box неожиданно завершился")
 		}
-		if !wasStop {
-			a.log("sing-box завершился")
+
+		// Если ядро должно работать, но процесс неожиданно завершился
+		// (например, при засыпании/пробуждении ПК или сбое сети),
+		// автоматически восстанавливаем его в фоне:
+		if !wasStop && a.coreDesiredRunningSnapshot() {
+			go a.scheduleCoreAutoRestart("unexpected-exit")
 		}
 	}(cmd, done)
 
 	return nil
+}
+
+func (a *App) scheduleCoreAutoRestart(reason string) {
+	time.Sleep(2 * time.Second)
+
+	for attempt := 1; attempt <= 5; attempt++ {
+		if !a.coreDesiredRunningSnapshot() {
+			return
+		}
+		if a.isProcessRunning() {
+			return
+		}
+
+		a.log("Фоновый супервизор: автоперезапуск sing-box (попытка %d/5, причина: %s)...", attempt, reason)
+		err := a.withRunningAction(func() error {
+			if !a.coreDesiredRunningSnapshot() || a.isProcessRunning() {
+				return nil
+			}
+			return a.startPipeline()
+		})
+		if err == nil && a.isProcessRunning() {
+			a.log("Фоновый супервизор: sing-box успешно перезапущен и работает в фоне")
+			return
+		}
+		a.log("Фоновый супервизор: попытка %d не удалась: %v", attempt, err)
+		time.Sleep(time.Duration(attempt*2) * time.Second)
+	}
 }
 
 func (a *App) stopProcess() {
@@ -533,7 +678,16 @@ func emptyIf(value, fallback string) string {
 func commandWithTimeout(bin string, timeout time.Duration, args ...string) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
+	binDir := filepath.Dir(bin)
 	cmd := exec.CommandContext(ctx, bin, args...)
+	cmd.Dir = binDir
+
+	env := os.Environ()
+	pathEnv := os.Getenv("PATH")
+	if !strings.Contains(strings.ToLower(pathEnv), strings.ToLower(binDir)) {
+		env = append(env, "PATH="+binDir+";"+pathEnv)
+	}
+	cmd.Env = env
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		CreationFlags: createNoWindow,
 		HideWindow:    true,

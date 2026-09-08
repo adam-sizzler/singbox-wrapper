@@ -45,7 +45,7 @@ Native Windows GUI client for `sing-box` with portable runtime behavior.
 
 ```bash
 go mod tidy
-./build-windows.sh
+make build-windows
 ```
 
 Output:
@@ -54,7 +54,7 @@ Output:
 ./singbox-wrapper.exe
 ```
 
-`build-windows.sh` also regenerates `cmd/singbox-gui/rsrc.syso` from:
+`make` (or `make build-windows`) also automatically compiles the frontend and regenerates `cmd/singbox-gui/rsrc.syso` from:
 
 - `build/windows/app.exe.manifest`
 - `build/windows/app-icon.ico` (can be generated from your SVG icon)

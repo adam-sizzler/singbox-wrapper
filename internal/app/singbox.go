@@ -6,7 +6,9 @@ import (
 	"archive/zip"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,11 +17,27 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
 
 const defaultDownloadTimeout = 60 * time.Second
+
+var (
+	rxTagTraffic = regexp.MustCompile(`(?i)\s*\|\s*[\d.,]+\s*(?:[KMGTPE]i?B|[КМГТПE]б|B|Б)(?:\s*/\s*[\d.,]+\s*(?:[KMGTPE]i?B|[КМГТПE]б|B|Б))?\s*трафика`)
+	rxTagDays    = regexp.MustCompile(`(?i)\s*\|\s*\d+\s*(?:дн\.|дней|дня|days?)\s*(?:осталось|left)?`)
+)
+
+func normalizeConfigForHash(b []byte) [32]byte {
+	s := string(b)
+	s = rxTagTraffic.ReplaceAllString(s, "")
+	s = rxTagDays.ReplaceAllString(s, "")
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.TrimSpace(s)
+	return sha256.Sum256([]byte(s))
+}
 
 func resolveVersion(version string) (string, error) {
 	v := strings.TrimSpace(strings.TrimPrefix(version, "v"))
@@ -93,56 +111,178 @@ func downloadAndInstallSingBox(version, targetExe string) error {
 		version,
 	)
 
+	targetDir := filepath.Dir(targetExe)
+	if err := os.MkdirAll(targetDir, 0o755); err != nil {
+		return err
+	}
+
 	zipPath := targetExe + ".zip"
 	if err := downloadFile(downloadURL, zipPath, map[string]string{"User-Agent": appUserAgent()}); err != nil {
 		return fmt.Errorf("не удалось скачать sing-box %s: %w", version, err)
 	}
 	defer os.Remove(zipPath)
 
-	if err := extractSingBoxExe(zipPath, targetExe); err != nil {
+	if err := extractSingBoxPackage(zipPath, targetExe); err != nil {
 		return fmt.Errorf("ошибка распаковки sing-box: %w", err)
 	}
 	return nil
 }
 
+type runtimeConfigDownloadResult struct {
+	Updated         bool
+	DetectedVersion string
+	Subscription    SubscriptionInfo
+}
+
+func decodeBase64Header(val string) string {
+	val = strings.TrimSpace(val)
+	if strings.HasPrefix(strings.ToLower(val), "base64:") {
+		encoded := val[7:]
+		if dec, err := base64.StdEncoding.DecodeString(strings.TrimSpace(encoded)); err == nil {
+			return strings.TrimSpace(string(dec))
+		}
+	}
+	return val
+}
+
+func parseSubscriptionUserInfo(raw string) (upload, download, total, expire int64) {
+	for _, part := range strings.Split(raw, ";") {
+		kv := strings.SplitN(strings.TrimSpace(part), "=", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		k := strings.ToLower(strings.TrimSpace(kv[0]))
+		v := strings.TrimSpace(kv[1])
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			continue
+		}
+		switch k {
+		case "upload":
+			upload = n
+		case "download":
+			download = n
+		case "total":
+			total = n
+		case "expire":
+			expire = n
+		}
+	}
+	return
+}
+
+func parseSubscriptionHeaders(h http.Header) SubscriptionInfo {
+	info := SubscriptionInfo{
+		LastUpdated: time.Now().Unix(),
+	}
+
+	if val := h.Get("profile-title"); val != "" {
+		info.Title = decodeBase64Header(val)
+	}
+	if val := h.Get("announce"); val != "" {
+		info.Announce = decodeBase64Header(val)
+	}
+	if val := h.Get("profile-web-page-url"); val != "" {
+		info.WebPageURL = strings.TrimSpace(val)
+	}
+	if val := h.Get("support-url"); val != "" {
+		info.SupportURL = strings.TrimSpace(val)
+	}
+	if val := h.Get("profile-update-interval"); val != "" {
+		if hrs, err := strconv.Atoi(strings.TrimSpace(val)); err == nil {
+			info.UpdateInterval = hrs
+		}
+	}
+	if val := h.Get("subscription-refill-date"); val != "" {
+		if ts, err := strconv.ParseInt(strings.TrimSpace(val), 10, 64); err == nil {
+			info.RefillDate = ts
+		}
+	}
+	if val := h.Get("subscription-userinfo"); val != "" {
+		info.Upload, info.Download, info.Total, info.Expire = parseSubscriptionUserInfo(val)
+	}
+	if cd := h.Get("content-disposition"); cd != "" {
+		for _, part := range strings.Split(cd, ";") {
+			part = strings.TrimSpace(part)
+			if strings.HasPrefix(strings.ToLower(part), "filename=") {
+				fn := strings.TrimPrefix(part, "filename=")
+				fn = strings.TrimPrefix(fn, "FILENAME=")
+				info.FileName = strings.Trim(fn, `"' `)
+			}
+		}
+	}
+
+	return info
+}
+
+func buildSFWUserAgent(coreVersion string) string {
+	v := strings.TrimSpace(coreVersion)
+	if v == "" || strings.EqualFold(v, "latest") {
+		v = "1.14.0"
+	} else {
+		v = strings.TrimPrefix(v, "v")
+		v = strings.TrimPrefix(v, "V")
+	}
+	return fmt.Sprintf("SFW (sing-box %s)", v)
+}
+
 func downloadRuntimeConfig(url, target string) (bool, error) {
-	return downloadRuntimeConfigWithOptions(url, target, 0, false)
+	res, err := downloadRuntimeConfigWithOptions(url, target, 0, false, "")
+	return res.Updated, err
 }
 
 func downloadRuntimeConfigWithTimeout(url, target string, timeout time.Duration) (bool, error) {
-	return downloadRuntimeConfigWithOptions(url, target, timeout, false)
+	res, err := downloadRuntimeConfigWithOptions(url, target, timeout, false, "")
+	return res.Updated, err
 }
 
-func downloadRuntimeConfigWithOptions(url, target string, timeout time.Duration, allowInsecure bool) (bool, error) {
+func downloadRuntimeConfigWithOptions(url, target string, timeout time.Duration, allowInsecure bool, coreVersion string) (runtimeConfigDownloadResult, error) {
 	targetName := filepath.Base(target)
 	tmpPath := target + ".download.tmp"
-	if err := downloadFileWithOptions(url, tmpPath, subscriptionRequestHeaders(), timeout, allowInsecure); err != nil {
-		return false, fmt.Errorf("не удалось скачать %s: %w", targetName, err)
+	headers := subscriptionRequestHeaders(coreVersion)
+	respHeaders, err := downloadFileWithResponseHeaders(url, tmpPath, headers, timeout, allowInsecure)
+	if err != nil {
+		return runtimeConfigDownloadResult{}, fmt.Errorf("не удалось скачать %s: %w", targetName, err)
 	}
 	defer os.Remove(tmpPath)
 
 	if err := validateRuntimeConfigFile(tmpPath); err != nil {
-		return false, fmt.Errorf("полученный %s не является валидным JSON: %w", targetName, err)
+		return runtimeConfigDownloadResult{}, fmt.Errorf("полученный %s не является валидным JSON: %w", targetName, err)
 	}
 
 	newContent, err := os.ReadFile(tmpPath)
 	if err != nil {
-		return false, err
+		return runtimeConfigDownloadResult{}, err
 	}
 
+	// Check core version from HTTP header (support singbox-version and sing-box-version)
+	var detectedVersion string
+	versionHeader := strings.TrimSpace(respHeaders.Get("sing-box-version"))
+	if versionHeader == "" {
+		versionHeader = strings.TrimSpace(respHeaders.Get("singbox-version"))
+	}
+	if versionHeader != "" {
+		detectedVersion = normalizeImportedCoreVersion(versionHeader)
+	}
+
+	subInfo := parseSubscriptionHeaders(respHeaders)
+
+	// Compare SHA-256 hash of configuration body (normalized for CRLF and dynamic tag counters)
+	newSum := normalizeConfigForHash(newContent)
 	oldContent, err := os.ReadFile(target)
 	if err == nil {
-		if bytes.Equal(bytes.TrimSpace(oldContent), bytes.TrimSpace(newContent)) {
-			return false, nil
+		oldSum := normalizeConfigForHash(oldContent)
+		if newSum == oldSum {
+			return runtimeConfigDownloadResult{Updated: false, DetectedVersion: detectedVersion, Subscription: subInfo}, nil
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return false, err
+		return runtimeConfigDownloadResult{}, err
 	}
 
 	if err := os.Rename(tmpPath, target); err != nil {
-		return false, err
+		return runtimeConfigDownloadResult{}, err
 	}
-	return true, nil
+	return runtimeConfigDownloadResult{Updated: true, DetectedVersion: detectedVersion, Subscription: subInfo}, nil
 }
 
 func ensureLocalRuntimeConfig(target string) error {
@@ -165,7 +305,12 @@ func ensureLocalRuntimeConfig(target string) error {
 					return nil
 				}
 			}
-			return fmt.Errorf("URL не указан, а локальный %s не найден", targetName)
+			// Starter template configuration for local profile testing
+			defaultLocalConfig := []byte("{\n  \"log\": {\n    \"level\": \"info\",\n    \"timestamp\": true\n  },\n  \"inbounds\": [\n    {\n      \"type\": \"mixed\",\n      \"tag\": \"mixed-in\",\n      \"listen\": \"127.0.0.1\",\n      \"listen_port\": 2080\n    }\n  ],\n  \"outbounds\": [\n    {\n      \"type\": \"direct\",\n      \"tag\": \"direct\"\n    }\n  ]\n}\n")
+			if err := os.WriteFile(target, defaultLocalConfig, 0o644); err != nil {
+				return fmt.Errorf("не удалось создать локальный %s: %w", targetName, err)
+			}
+			return nil
 		}
 		return err
 	}
@@ -185,7 +330,7 @@ func validateRemoteRuntimeConfigWithTimeout(url string, timeout time.Duration) e
 
 func validateRemoteRuntimeConfigWithOptions(url string, timeout time.Duration, allowInsecure bool) error {
 	tmpPath := filepath.Join(os.TempDir(), fmt.Sprintf("singbox-wrapper-config-check-%d.json", time.Now().UnixNano()))
-	if err := downloadFileWithOptions(url, tmpPath, subscriptionRequestHeaders(), timeout, allowInsecure); err != nil {
+	if err := downloadFileWithOptions(url, tmpPath, subscriptionRequestHeaders(""), timeout, allowInsecure); err != nil {
 		return fmt.Errorf("не удалось скачать runtime-конфиг: %w", err)
 	}
 	defer os.Remove(tmpPath)
@@ -194,27 +339,25 @@ func validateRemoteRuntimeConfigWithOptions(url string, timeout time.Duration, a
 
 func validateRemoteRuntimeConfigWithSingBox(url string, timeout time.Duration, allowInsecure bool, singboxPath string, checkTimeout time.Duration) error {
 	tmpPath := filepath.Join(os.TempDir(), fmt.Sprintf("singbox-wrapper-config-check-%d.json", time.Now().UnixNano()))
-	if err := downloadFileWithOptions(url, tmpPath, subscriptionRequestHeaders(), timeout, allowInsecure); err != nil {
+	if err := downloadFileWithOptions(url, tmpPath, subscriptionRequestHeaders(""), timeout, allowInsecure); err != nil {
 		return fmt.Errorf("не удалось скачать runtime-конфиг: %w", err)
 	}
 	defer os.Remove(tmpPath)
 	return validateRuntimeConfigWithSingBox(singboxPath, tmpPath, checkTimeout)
 }
 
-func subscriptionRequestHeaders() map[string]string {
-	metadata := appDeviceMetadata()
+func subscriptionRequestHeaders(coreVersion string) map[string]string {
+	ua := buildSFWUserAgent(coreVersion)
+	v := strings.TrimSpace(coreVersion)
+	if v == "" || strings.EqualFold(v, "latest") {
+		v = "1.14.0"
+	} else {
+		v = strings.TrimPrefix(v, "v")
+		v = strings.TrimPrefix(v, "V")
+	}
 	return map[string]string{
-		"User-Agent":             metadata.UserAgent,
-		"X-HWID":                 metadata.HWID,
-		"X-Device-OS":            metadata.Platform,
-		"X-Ver-OS":               metadata.OSVersion,
-		"X-Device-Model":         metadata.DeviceModel,
-		"X-App-Version":          metadata.AppVersion,
-		"X-HWID-Platform":        metadata.Platform,
-		"X-HWID-OS-Version":      metadata.OSVersion,
-		"X-HWID-Device-Model":    metadata.DeviceModel,
-		"X-HWID-User-Agent":      metadata.UserAgent,
-		"X-Singbox-Wrapper-HWID": metadata.HWID,
+		"User-Agent":       ua,
+		"sing-box-version": v,
 	}
 }
 
@@ -256,6 +399,11 @@ func downloadFileWithTimeout(url, target string, headers map[string]string, time
 }
 
 func downloadFileWithOptions(url, target string, headers map[string]string, timeout time.Duration, allowInsecure bool) error {
+	_, err := downloadFileWithResponseHeaders(url, target, headers, timeout, allowInsecure)
+	return err
+}
+
+func downloadFileWithResponseHeaders(url, target string, headers map[string]string, timeout time.Duration, allowInsecure bool) (http.Header, error) {
 	if timeout <= 0 {
 		timeout = defaultDownloadTimeout
 	}
@@ -265,7 +413,7 @@ func downloadFileWithOptions(url, target string, headers map[string]string, time
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	for k, v := range headers {
 		req.Header.Set(k, v)
@@ -298,73 +446,96 @@ func downloadFileWithOptions(url, target string, headers map[string]string, time
 	if err != nil {
 		var netErr net.Error
 		if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout()) {
-			return fmt.Errorf("превышено время ожидания (%s)", timeout.Round(time.Second))
+			return nil, fmt.Errorf("превышено время ожидания (%s)", timeout.Round(time.Second))
 		}
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("HTTP %d", resp.StatusCode)
+		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 
 	tmpPath := target + ".tmp"
 	file, err := os.Create(tmpPath)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if _, err := io.Copy(file, resp.Body); err != nil {
 		file.Close()
 		_ = os.Remove(tmpPath)
-		return err
+		return nil, err
 	}
 	if err := file.Close(); err != nil {
 		_ = os.Remove(tmpPath)
-		return err
+		return nil, err
 	}
 
 	if err := os.Rename(tmpPath, target); err != nil {
 		_ = os.Remove(tmpPath)
-		return err
+		return nil, err
 	}
-	return nil
+	return resp.Header.Clone(), nil
 }
 
-func extractSingBoxExe(zipPath, targetExe string) error {
+func extractSingBoxPackage(zipPath, targetExe string) error {
 	r, err := zip.OpenReader(zipPath)
 	if err != nil {
 		return err
 	}
 	defer r.Close()
 
+	targetDir := filepath.Dir(targetExe)
+	if err := os.MkdirAll(targetDir, 0o755); err != nil {
+		return err
+	}
+
+	foundExe := false
 	for _, f := range r.File {
-		if strings.EqualFold(filepath.Base(f.Name), singboxExeName) {
+		if f.FileInfo().IsDir() {
+			continue
+		}
+		baseName := filepath.Base(f.Name)
+		ext := strings.ToLower(filepath.Ext(baseName))
+		// Extract sing-box.exe, libcronet.dll and any DLL or executable files
+		if strings.EqualFold(baseName, singboxExeName) || ext == ".dll" || ext == ".exe" {
 			rc, err := f.Open()
 			if err != nil {
 				return err
 			}
-			defer rc.Close()
 
-			tmp := targetExe + ".tmp"
-			out, err := os.Create(tmp)
+			destPath := filepath.Join(targetDir, baseName)
+			tmpPath := destPath + ".tmp"
+			out, err := os.Create(tmpPath)
 			if err != nil {
+				rc.Close()
 				return err
 			}
 			if _, err := io.Copy(out, rc); err != nil {
 				out.Close()
-				_ = os.Remove(tmp)
+				rc.Close()
+				_ = os.Remove(tmpPath)
 				return err
 			}
 			if err := out.Close(); err != nil {
-				_ = os.Remove(tmp)
+				rc.Close()
+				_ = os.Remove(tmpPath)
 				return err
 			}
-			if err := os.Rename(tmp, targetExe); err != nil {
-				_ = os.Remove(tmp)
+			rc.Close()
+
+			if err := os.Rename(tmpPath, destPath); err != nil {
+				_ = os.Remove(tmpPath)
 				return err
 			}
-			return nil
+			if strings.EqualFold(baseName, singboxExeName) {
+				foundExe = true
+			}
 		}
 	}
-	return errors.New("sing-box.exe не найден в архиве")
+
+	if !foundExe {
+		return errors.New("sing-box.exe не найден в архиве")
+	}
+	return nil
 }

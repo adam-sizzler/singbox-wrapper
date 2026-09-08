@@ -8,7 +8,10 @@ import (
 	"os"
 	"path/filepath"
 	"runtime/debug"
+	"strings"
 	"time"
+
+	"singbox-gui-client/internal/app/db"
 )
 
 func Run(args []string) {
@@ -31,6 +34,17 @@ func Run(args []string) {
 
 	app := newApp(workDir)
 
+	// Initialize SQLite Database
+	dbPath := filepath.Join(workDir, "singbox-wrapper.db")
+	store, err := db.InitDB(dbPath)
+	if err != nil {
+		showError("Database error", "Не удалось инициализировать базу данных SQLite:\n"+err.Error())
+		return
+	}
+	defer store.Close()
+	_ = store.EnsureInitialData()
+	app.store = store
+
 	startupImport := findImportURIArg(args)
 	app.startupImport = startupImport
 
@@ -47,19 +61,23 @@ func Run(args []string) {
 		app.protoRegWarn = err.Error()
 	}
 
-	cfg, err := loadOrCreateConfig(app.configPath)
-	if err != nil {
-		showError("Config error", "Не удалось прочитать config.yaml:\n"+err.Error())
-		return
+	var cfg AppConfig
+	if storeCfg, ok := app.loadConfigFromStore(); ok {
+		cfg = storeCfg
+	} else {
+		loadedCfg, err := loadOrCreateConfig(app.configPath)
+		if err != nil {
+			showError("Config error", "Не удалось прочитать конфигурацию:\n"+err.Error())
+			return
+		}
+		cfg = loadedCfg
+		normalizeConfigProfiles(&cfg)
 	}
-	normalizeConfigProfiles(&cfg)
 	applyImportURIToConfig(&cfg, app.startupImport)
 
-	if err := saveConfig(app.configPath, cfg); err != nil {
-		showError("Config error", "Не удалось сохранить config.yaml:\n"+err.Error())
-		return
-	}
+	_ = saveConfig(app.configPath, cfg)
 	app.setConfig(cfg)
+	app.syncConfigToStore(cfg)
 
 	if err := app.startInstanceIPC(); err != nil {
 		if errors.Is(err, errInstanceAlreadyRunning) {
@@ -72,6 +90,15 @@ func Run(args []string) {
 		app.stopInstanceIPC()
 	}()
 
+	go func() {
+		time.Sleep(300 * time.Millisecond)
+		currentCfg := app.getConfigSnapshot()
+		active := activeProfileFromConfig(currentCfg)
+		if strings.TrimSpace(active.URL) != "" {
+			_ = app.refreshConfigAction()
+		}
+	}()
+
 	if err := app.runUI(); err != nil {
 		showError("UI error", err.Error())
 		return
@@ -79,10 +106,22 @@ func Run(args []string) {
 }
 
 func newApp(workDir string) *App {
+	singBoxDir := filepath.Join(workDir, "singbox")
+	_ = os.MkdirAll(singBoxDir, 0o755)
+
+	targetExe := filepath.Join(singBoxDir, singboxExeName)
+	// Migrate legacy sing-box.exe from root workDir to singbox/ folder if present
+	legacyExe := filepath.Join(workDir, singboxExeName)
+	if _, err := os.Stat(targetExe); errors.Is(err, os.ErrNotExist) {
+		if _, legErr := os.Stat(legacyExe); legErr == nil {
+			_ = os.Rename(legacyExe, targetExe)
+		}
+	}
+
 	return &App{
 		workDir:     workDir,
 		configPath:  filepath.Join(workDir, configFileName),
-		singBoxPath: filepath.Join(workDir, singboxExeName),
+		singBoxPath: targetExe,
 		logEntries:  make([]logEntry, 0, maxLogLines),
 	}
 }

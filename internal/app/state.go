@@ -3,10 +3,12 @@
 package app
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -15,6 +17,8 @@ import (
 	"github.com/lxn/walk"
 	"github.com/lxn/win"
 	"golang.org/x/sys/windows"
+
+	"singbox-gui-client/internal/app/db"
 )
 
 const (
@@ -51,6 +55,7 @@ type App struct {
 	singBoxPath   string
 	startupImport string
 	protoRegWarn  string
+	store         *db.DBStore
 
 	cfgMu  sync.Mutex
 	config AppConfig
@@ -71,6 +76,7 @@ type App struct {
 	selectorCacheLive      bool
 	selectorCacheExpiresAt time.Time
 	selectorCacheGroups    []SelectorGroupState
+	selectorCacheOutbounds map[string]OutboundInfo
 	selectorDelayCache     map[string]SelectorOptionDelayState
 
 	trafficMu            sync.Mutex
@@ -82,7 +88,7 @@ type App struct {
 	runMu         sync.Mutex
 	runningAction bool
 
-	logMu      sync.Mutex
+	logMu      sync.RWMutex
 	logEntries []logEntry
 	logStart   int
 	nextLogID  int64
@@ -145,25 +151,34 @@ type AppState struct {
 	AccentColor         string               `json:"accent_color"`
 	HWID                string               `json:"hwid"`
 	URL                 string               `json:"url"`
-	Version             string               `json:"version"`
-	SelectorGroups      []SelectorGroupState `json:"selector_groups,omitempty"`
-	SelectorCollapsed   map[string]bool      `json:"selector_collapsed_groups,omitempty"`
-	AutoUpdateHours     int                  `json:"auto_update_hours"`
-	AutoStartCore       bool                 `json:"auto_start_core"`
-	StartMinimizedTray  bool                 `json:"start_minimized_to_tray"`
-	UIScale             float64              `json:"ui_scale"`
-	UptimeSeconds       int64                `json:"uptime_seconds"`
-	Running             bool                 `json:"running"`
-	Busy                bool                 `json:"busy"`
-	AllowInsecure       bool                 `json:"allow_insecure"`
-	ProtoRegWarn        string               `json:"proto_reg_warn,omitempty"`
-	AppReleaseTag       string               `json:"app_release_tag,omitempty"`
-	AppReleaseURL       string               `json:"app_release_url,omitempty"`
-	AppUpdateAvailable  bool                 `json:"app_update_available"`
-	AppLatestReleaseTag string               `json:"app_latest_release_tag,omitempty"`
-	AppLatestReleaseURL string               `json:"app_latest_release_url,omitempty"`
+	Version             string                  `json:"version"`
+	SelectorGroups      []SelectorGroupState    `json:"selector_groups,omitempty"`
+	SelectorCollapsed   map[string]bool         `json:"selector_collapsed_groups,omitempty"`
+	Outbounds           map[string]OutboundInfo `json:"outbounds,omitempty"`
+	AutoUpdateHours     int                     `json:"auto_update_hours"`
+	AutoStartCore       bool                    `json:"auto_start_core"`
+	StartMinimizedTray  bool                    `json:"start_minimized_to_tray"`
+	UIScale             float64                 `json:"ui_scale"`
+	UptimeSeconds       int64                   `json:"uptime_seconds"`
+	Running             bool                    `json:"running"`
+	Busy                bool                    `json:"busy"`
+	AllowInsecure       bool                    `json:"allow_insecure"`
+	ProtoRegWarn        string                  `json:"proto_reg_warn,omitempty"`
+	AppReleaseTag       string                  `json:"app_release_tag,omitempty"`
+	AppReleaseURL       string                  `json:"app_release_url,omitempty"`
+	AppUpdateAvailable  bool                    `json:"app_update_available"`
+	AppLatestReleaseTag string                  `json:"app_latest_release_tag,omitempty"`
+	AppLatestReleaseURL string                  `json:"app_latest_release_url,omitempty"`
 	// AppUpdateProgress: -1 = не активно, 0–100 = процент скачивания
 	AppUpdateProgress   int                  `json:"app_update_progress"`
+	Subscription        *SubscriptionInfo    `json:"subscription,omitempty"`
+}
+
+type OutboundInfo struct {
+	Tag        string `json:"tag"`
+	Type       string `json:"type"`
+	Server     string `json:"server,omitempty"`
+	ServerPort int    `json:"server_port,omitempty"`
 }
 
 func (a *App) setConfig(cfg AppConfig) {
@@ -190,10 +205,132 @@ func (a *App) persistConfig(cfg AppConfig) error {
 	if err := saveConfig(a.configPath, cfg); err != nil {
 		return err
 	}
+	a.syncConfigToStore(cfg)
 	a.setConfig(cfg)
 	a.invalidateSelectorCache()
 	a.triggerAutoUpdateReconfigure()
 	return nil
+}
+
+func (a *App) syncConfigToStore(cfg AppConfig) {
+	if a.store == nil {
+		return
+	}
+	_ = a.store.SetSetting("language", cfg.Language)
+	_ = a.store.SetSetting("theme_mode", cfg.ThemeMode)
+	_ = a.store.SetSetting("accent_color", cfg.AccentColor)
+	_ = a.store.SetSetting("auto_update_hours", fmt.Sprintf("%d", cfg.AutoUpdateHours))
+	if cfg.AutoStartCore {
+		_ = a.store.SetSetting("auto_start_core", "true")
+	} else {
+		_ = a.store.SetSetting("auto_start_core", "false")
+	}
+	if cfg.StartMinimizedToTray {
+		_ = a.store.SetSetting("start_minimized_to_tray", "true")
+	} else {
+		_ = a.store.SetSetting("start_minimized_to_tray", "false")
+	}
+	if cfg.AllowInsecure {
+		_ = a.store.SetSetting("allow_insecure", "true")
+	} else {
+		_ = a.store.SetSetting("allow_insecure", "false")
+	}
+
+	for _, p := range cfg.Profiles {
+		isActive := strings.EqualFold(p.Name, cfg.CurrentProfile)
+		_ = a.store.SaveProfile(p.Name, p.URL, p.Version, isActive)
+		if len(p.SelectorSelections) > 0 {
+			_ = a.store.SaveSelectorSelections(p.Name, p.SelectorSelections)
+		}
+		if len(p.SelectorCollapsedGroups) > 0 {
+			_ = a.store.SaveSelectorCollapsed(p.Name, p.SelectorCollapsedGroups)
+		}
+		if p.Subscription != nil {
+			_ = a.store.SaveProfileSubscription(p.Name, db.SubscriptionRecord{
+				ProfileName:    p.Name,
+				Title:          p.Subscription.Title,
+				Announce:       p.Subscription.Announce,
+				WebPageURL:     p.Subscription.WebPageURL,
+				SupportURL:     p.Subscription.SupportURL,
+				UpdateInterval: p.Subscription.UpdateInterval,
+				Upload:         p.Subscription.Upload,
+				Download:       p.Subscription.Download,
+				Total:          p.Subscription.Total,
+				Expire:         p.Subscription.Expire,
+				RefillDate:     p.Subscription.RefillDate,
+				LastUpdated:    p.Subscription.LastUpdated,
+				FileName:       p.Subscription.FileName,
+			})
+		}
+	}
+}
+
+func (a *App) loadConfigFromStore() (AppConfig, bool) {
+	if a.store == nil {
+		return AppConfig{}, false
+	}
+	dbProfiles, err := a.store.GetProfiles()
+	if err != nil || len(dbProfiles) == 0 {
+		return AppConfig{}, false
+	}
+
+	settings, _ := a.store.GetAllSettings()
+
+	cfg := AppConfig{
+		Language:             settings["language"],
+		ThemeMode:            settings["theme_mode"],
+		AccentColor:          settings["accent_color"],
+		AutoStartCore:        settings["auto_start_core"] == "true",
+		StartMinimizedToTray: settings["start_minimized_to_tray"] == "true",
+		AllowInsecure:        settings["allow_insecure"] == "true",
+	}
+	if hrs, err := strconv.Atoi(settings["auto_update_hours"]); err == nil {
+		cfg.AutoUpdateHours = hrs
+	}
+	if envStr := settings["singbox_env"]; envStr != "" {
+		var envMap map[string]string
+		if json.Unmarshal([]byte(envStr), &envMap) == nil {
+			cfg.SingboxEnv = envMap
+		}
+	}
+
+	for _, p := range dbProfiles {
+		selections, _ := a.store.GetSelectorSelections(p.Name)
+		collapsed, _ := a.store.GetSelectorCollapsed(p.Name)
+		var sub *SubscriptionInfo
+		if dbSub, _ := a.store.GetProfileSubscription(p.Name); dbSub != nil {
+			sub = &SubscriptionInfo{
+				Title:          dbSub.Title,
+				Announce:       dbSub.Announce,
+				WebPageURL:     dbSub.WebPageURL,
+				SupportURL:     dbSub.SupportURL,
+				UpdateInterval: dbSub.UpdateInterval,
+				Upload:         dbSub.Upload,
+				Download:       dbSub.Download,
+				Total:          dbSub.Total,
+				Expire:         dbSub.Expire,
+				RefillDate:     dbSub.RefillDate,
+				LastUpdated:    dbSub.LastUpdated,
+				FileName:       dbSub.FileName,
+			}
+		}
+		cfg.Profiles = append(cfg.Profiles, ConfigProfile{
+			Name:                    p.Name,
+			URL:                     p.Url,
+			Version:                 p.Version,
+			SelectorSelections:      selections,
+			SelectorCollapsedGroups: collapsed,
+			Subscription:            sub,
+		})
+		if p.IsActive == 1 {
+			cfg.CurrentProfile = p.Name
+		}
+	}
+	if cfg.CurrentProfile == "" && len(cfg.Profiles) > 0 {
+		cfg.CurrentProfile = cfg.Profiles[0].Name
+	}
+	normalizeConfigProfiles(&cfg)
+	return cfg, true
 }
 
 // uiScaleForState возвращает масштаб для передачи во фронтенд.
@@ -217,6 +354,12 @@ func (a *App) snapshotState() AppState {
 	appUpdateAvailable, appLatestTag, appLatestURL := a.appUpdateSnapshot()
 	selectorGroups := a.selectorGroupsSnapshot(active, running, busy)
 
+	var activeSub *SubscriptionInfo
+	if active.Subscription != nil {
+		subCopy := *active.Subscription
+		activeSub = &subCopy
+	}
+
 	return AppState{
 		CurrentProfile:      cfg.CurrentProfile,
 		Profiles:            cloneConfigProfiles(cfg.Profiles),
@@ -229,6 +372,7 @@ func (a *App) snapshotState() AppState {
 		Version:             active.Version,
 		SelectorGroups:      selectorGroups,
 		SelectorCollapsed:   cloneSelectorCollapsedGroups(active.SelectorCollapsedGroups),
+		Outbounds:           a.outboundsSnapshotForProfile(active.Name, running),
 		AutoUpdateHours:     cfg.AutoUpdateHours,
 		AutoStartCore:       cfg.AutoStartCore,
 		StartMinimizedTray:  cfg.StartMinimizedToTray,
@@ -244,6 +388,7 @@ func (a *App) snapshotState() AppState {
 		AppLatestReleaseTag: appLatestTag,
 		AppLatestReleaseURL: appLatestURL,
 		AppUpdateProgress:   int(atomic.LoadInt32(&a.appUpdateProgressVal)),
+		Subscription:        activeSub,
 	}
 }
 

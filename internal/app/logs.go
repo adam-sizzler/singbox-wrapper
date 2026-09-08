@@ -109,6 +109,10 @@ func normalizeLogChunks(line string) []string {
 		return nil
 	}
 
+	if !strings.Contains(line, "\n") && !strings.Contains(line, "\r") {
+		return []string{line}
+	}
+
 	line = logLineBreakReplacer.Replace(line)
 
 	raw := strings.Split(line, "\n")
@@ -124,36 +128,51 @@ func normalizeLogChunks(line string) []string {
 }
 
 func (a *App) logsSince(fromID int64) ([]logEntry, int64) {
-	a.logMu.Lock()
-	defer a.logMu.Unlock()
+	a.logMu.RLock()
+	defer a.logMu.RUnlock()
 
-	if len(a.logEntries) == 0 {
-		return nil, a.nextLogID
-	}
-	if fromID >= a.nextLogID {
+	n := len(a.logEntries)
+	if n == 0 || fromID >= a.nextLogID {
 		return nil, a.nextLogID
 	}
 
-	entries := make([]logEntry, 0, len(a.logEntries))
-	for i := 0; i < len(a.logEntries); i++ {
-		e := a.logEntries[(a.logStart+i)%len(a.logEntries)]
-		if e.ID > fromID {
-			entries = append(entries, e)
+	// Ring buffer is ordered by ID from logical index 0 to n-1.
+	// Use binary search O(log N) to find first entry where ID > fromID.
+	low := 0
+	high := n
+	for low < high {
+		mid := low + (high-low)/2
+		idx := (a.logStart + mid) % n
+		if a.logEntries[idx].ID > fromID {
+			high = mid
+		} else {
+			low = mid + 1
 		}
+	}
+
+	count := n - low
+	if count <= 0 {
+		return nil, a.nextLogID
+	}
+
+	entries := make([]logEntry, count)
+	for i := 0; i < count; i++ {
+		entries[i] = a.logEntries[(a.logStart+low+i)%n]
 	}
 	return entries, a.nextLogID
 }
 
 func (a *App) logsText() string {
-	a.logMu.Lock()
-	defer a.logMu.Unlock()
-	if len(a.logEntries) == 0 {
+	a.logMu.RLock()
+	defer a.logMu.RUnlock()
+	n := len(a.logEntries)
+	if n == 0 {
 		return ""
 	}
-	lines := make([]string, 0, len(a.logEntries))
-	for i := 0; i < len(a.logEntries); i++ {
-		e := a.logEntries[(a.logStart+i)%len(a.logEntries)]
-		lines = append(lines, e.Text)
+	lines := make([]string, n)
+	for i := 0; i < n; i++ {
+		e := a.logEntries[(a.logStart+i)%n]
+		lines[i] = e.Text
 	}
 	return strings.Join(lines, "\r\n")
 }

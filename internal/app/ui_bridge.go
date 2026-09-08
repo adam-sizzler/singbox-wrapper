@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 )
@@ -20,6 +21,16 @@ type logsResponse struct {
 
 type profileRequest struct {
 	Name string `json:"name"`
+}
+
+type configResponse struct {
+	Content string `json:"content"`
+	Path    string `json:"path"`
+	Profile string `json:"profile"`
+}
+
+type configSaveRequest struct {
+	Content string `json:"content"`
 }
 
 type uiBridgeRequest struct {
@@ -63,6 +74,37 @@ func (a *App) handleUIBridgeCall(req uiBridgeRequest) (any, error) {
 			return a.snapshotState(), nil
 		case "/api/traffic":
 			return a.trafficSnapshot(), nil
+		case "/api/config":
+			cfg := a.getConfigSnapshot()
+			profileName := cfg.CurrentProfile
+			if profileName == "" && len(cfg.Profiles) > 0 {
+				profileName = cfg.Profiles[0].Name
+			}
+			cfgPath := a.runtimeConfigPathForProfile(profileName)
+			var content string
+			if a.store != nil {
+				content, _ = a.store.GetProfileConfig(profileName)
+			}
+			if content == "" {
+				data, err := os.ReadFile(cfgPath)
+				if err != nil {
+					if os.IsNotExist(err) {
+						content = "{\n  \"log\": {\n    \"level\": \"info\"\n  }\n}\n"
+					} else {
+						return nil, fmt.Errorf("read config file: %w", err)
+					}
+				} else {
+					content = string(data)
+					if a.store != nil {
+						_ = a.store.SaveProfileConfig(profileName, content)
+					}
+				}
+			}
+			return configResponse{
+				Content: content,
+				Path:    cfgPath,
+				Profile: profileName,
+			}, nil
 		case "/api/logs":
 			fromID := int64(0)
 			if s := strings.TrimSpace(parsedPath.Query().Get("from")); s != "" {
@@ -125,38 +167,79 @@ func (a *App) handleUIBridgeCall(req uiBridgeRequest) (any, error) {
 			if err := decodeBridgeBody(req.Body, &selectorReq); err != nil {
 				return nil, err
 			}
-			return a.checkSelectorDelay(selectorReq.Selector, selectorReq.Outbound)
+			go func() {
+				if _, err := a.checkSelectorDelay(selectorReq.Selector, selectorReq.Outbound); err != nil {
+					a.log("Ошибка проверки задержки: %v", err)
+				}
+			}()
+			return map[string]any{"ok": true, "started": true}, nil
 		case "/api/selector/delay-all":
 			var selectorReq selectorDelayAllRequest
 			if err := decodeBridgeBody(req.Body, &selectorReq); err != nil {
 				return nil, err
 			}
-			return a.checkSelectorDelays(selectorReq.Selector)
+			go func() {
+				if _, err := a.checkSelectorDelays(selectorReq.Selector); err != nil {
+					a.log("Ошибка проверки задержек: %v", err)
+				}
+			}()
+			return map[string]any{"ok": true, "started": true}, nil
 		case "/api/action/start-stop":
-			if err := a.toggleStartStop(); err != nil {
-				return nil, err
-			}
+			go func() {
+				if err := a.toggleStartStop(); err != nil {
+					a.log("Ошибка переключения ядра: %v", err)
+				}
+			}()
 			return a.snapshotState(), nil
-		case "/api/action/check-config":
-			if err := a.checkConfigAction(); err != nil {
-				return nil, err
-			}
-			return a.snapshotState(), nil
+
 		case "/api/action/refresh-config":
-			if err := a.refreshConfigAction(); err != nil {
-				return nil, err
-			}
+			go func() {
+				if err := a.refreshConfigAction(); err != nil {
+					a.log("Ошибка обновления конфигурации: %v", err)
+				}
+			}()
+			return a.snapshotState(), nil
+		case "/api/action/restart-core":
+			go func() {
+				if err := a.restartCoreAction(); err != nil {
+					a.log("Ошибка перезапуска ядра: %v", err)
+				}
+			}()
 			return a.snapshotState(), nil
 		case "/api/action/copy-logs":
-			if err := a.copyLogsToClipboard(); err != nil {
-				return nil, err
-			}
+			go func() {
+				if err := a.copyLogsToClipboard(); err != nil {
+					a.log("Ошибка копирования логов: %v", err)
+				}
+			}()
 			return map[string]bool{"ok": true}, nil
 		case "/api/action/update-app":
-			if err := a.updateApplicationAction(); err != nil {
+			go func() {
+				if err := a.updateApplicationAction(); err != nil {
+					a.log("Ошибка обновления приложения: %v", err)
+				}
+			}()
+			return map[string]bool{"ok": true}, nil
+		case "/api/config":
+			var saveReq configSaveRequest
+			if err := decodeBridgeBody(req.Body, &saveReq); err != nil {
 				return nil, err
 			}
-			return map[string]bool{"ok": true}, nil
+			cfg := a.getConfigSnapshot()
+			profileName := cfg.CurrentProfile
+			if profileName == "" && len(cfg.Profiles) > 0 {
+				profileName = cfg.Profiles[0].Name
+			}
+			cfgPath := a.runtimeConfigPathForProfile(profileName)
+			if a.store != nil {
+				if err := a.store.SaveProfileConfig(profileName, saveReq.Content); err != nil {
+					return nil, fmt.Errorf("save config to db: %w", err)
+				}
+			}
+			if err := os.WriteFile(cfgPath, []byte(saveReq.Content), 0644); err != nil {
+				return nil, fmt.Errorf("write config file: %w", err)
+			}
+			return map[string]any{"ok": true, "path": cfgPath}, nil
 		}
 	}
 

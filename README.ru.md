@@ -45,7 +45,7 @@
 
 ```bash
 go mod tidy
-./build-windows.sh
+make build-windows
 ```
 
 Результат:
@@ -54,7 +54,7 @@ go mod tidy
 ./singbox-wrapper.exe
 ```
 
-`build-windows.sh` также пересоздает `cmd/singbox-gui/rsrc.syso` из:
+`make` (или `make build-windows`) также автоматически собирает фронтенд и пересоздает `cmd/singbox-gui/rsrc.syso` из:
 
 - `build/windows/app.exe.manifest`
 - `build/windows/app-icon.ico` (можно генерировать из SVG-иконки)
